@@ -40,6 +40,19 @@ sherlock
 
 Subcommands are invoked as `sherlock <command> [options]`.
 
+Connect Gmail with a Google OAuth Desktop credentials JSON file:
+
+```bash
+sherlock connections gmail connect --credentials /path/to/credentials.json
+```
+
+Watch Gmail in the foreground. The first run records the current inbox as the
+baseline; each new inbox email after that runs `touch ~/hello.txt`.
+
+```bash
+sherlock connections gmail watch
+```
+
 ## Adding a command
 
 Each subcommand lives in `src/agent_sherlock/commands/`. Copy `_template.py`,

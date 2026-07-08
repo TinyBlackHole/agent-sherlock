@@ -17,6 +17,11 @@ classifiers = [
   "License :: Other/Proprietary License",
   "Operating System :: OS Independent",
 ]
+dependencies = [
+  "google-api-python-client>=2",
+  "google-auth-httplib2>=0.2",
+  "google-auth-oauthlib>=1",
+]
 
 [project.optional-dependencies]
 dev = [
