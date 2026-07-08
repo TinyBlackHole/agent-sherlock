@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-sherlock"
+dynamic = ["version"]
+description = "Agent Sherlock command-line application."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+  { name = "TinyBlackHole" }
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[project.urls]
+Homepage = "https://github.com/TinyBlackHole/agent-sherlock"
+Source = "https://github.com/TinyBlackHole/agent-sherlock"
+
+[project.scripts]
+sherlock = "agent_sherlock.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "agent_sherlock.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
