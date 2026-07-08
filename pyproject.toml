@@ -21,6 +21,7 @@ classifiers = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
+  "ruff>=0.6",
 ]
 
 [project.urls]
@@ -39,3 +40,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: isort, UP: pyupgrade, B: bugbear.
+select = ["E", "W", "F", "I", "UP", "B"]

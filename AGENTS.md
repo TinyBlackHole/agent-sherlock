@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Agent Sherlock — a Python CLI (`sherlock`), `src/` layout, entry point `agent_sherlock.cli:main`.
 
@@ -18,3 +18,16 @@ Agent Sherlock — a Python CLI (`sherlock`), `src/` layout, entry point `agent_
 
 Run with plain `python3 -m pytest` — `pythonpath = ["src"]` is set in
 `pyproject.toml`, so no install step is needed. Add a test for each new command.
+
+## Linting & formatting
+
+[ruff](https://docs.astral.sh/ruff/) handles both. Config lives in
+`pyproject.toml` (`[tool.ruff]`); line length is the default 88.
+
+```bash
+ruff check .          # lint
+ruff check --fix .    # lint + autofix
+ruff format .         # format
+```
+
+CI (and pre-merge) expects `ruff check .` and `ruff format --check .` to pass.

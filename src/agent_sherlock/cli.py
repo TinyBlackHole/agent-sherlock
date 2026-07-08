@@ -27,7 +27,9 @@ def build_parser(commands: Sequence[Command] = COMMANDS) -> argparse.ArgumentPar
     return parser
 
 
-def main(argv: Sequence[str] | None = None, commands: Sequence[Command] = COMMANDS) -> int:
+def main(
+    argv: Sequence[str] | None = None, commands: Sequence[Command] = COMMANDS
+) -> int:
     parser = build_parser(commands)
     args = parser.parse_args(argv)
 
