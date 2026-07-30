@@ -1,17 +1,20 @@
 import argparse
 import json
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from agent_sherlock import input_settings
 from agent_sherlock.application import MessagePipeline, SyncResult
 from agent_sherlock.cli import main
 from agent_sherlock.commands import (
     connections,
     connections_discord,
     connections_gmail,
-    connections_telegram,
+    connections_shared,
 )
 from agent_sherlock.connectors import ConnectorBatch
 from agent_sherlock.domain import InboundMessage
@@ -21,7 +24,7 @@ from agent_sherlock.integrations.gmail import (
     GmailProfile,
     GmailStatus,
 )
-from agent_sherlock.integrations.telegram import TelegramAPIError, TelegramStatus
+from agent_sherlock.integrations.telegram import TelegramAPIError
 from agent_sherlock.persistence import MessageRepository
 
 
@@ -41,8 +44,8 @@ def test_connections_without_provider_prints_help(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "usage: sherlock connections" in output
     assert "gmail" in output
-    assert "telegram" in output
     assert "discord" in output
+    assert "telegram" not in output
 
 
 def test_gmail_without_action_prints_help(monkeypatch, capsys):
@@ -56,6 +59,8 @@ def test_gmail_without_action_prints_help(monkeypatch, capsys):
     assert "fetch" in output
     assert "watch" in output
     assert "status" in output
+    assert "enable" in output
+    assert "disable" in output
 
 
 def test_gmail_without_action_opens_gmail_menu_in_terminal(monkeypatch):
@@ -68,18 +73,6 @@ def test_gmail_without_action_opens_gmail_menu_in_terminal(monkeypatch):
     monkeypatch.setattr(connections, "run_interactive_menu", unexpected_root_menu)
 
     assert main(["connections", "gmail"]) == 17
-
-
-def test_telegram_without_action_prints_help(monkeypatch, capsys):
-    monkeypatch.setattr(connections, "is_interactive_terminal", lambda: False)
-
-    assert main(["connections", "telegram"]) == 0
-
-    output = capsys.readouterr().out
-    assert "usage: sherlock connections telegram" in output
-    assert "connect" in output
-    assert "test" in output
-    assert "status" in output
 
 
 def test_gmail_connect_requires_credentials_without_terminal(monkeypatch, capsys):
@@ -96,6 +89,7 @@ def test_gmail_connect_requires_credentials_without_terminal(monkeypatch, capsys
 
 def test_gmail_connect_prints_connected_account(monkeypatch, capsys):
     seen = []
+    input_settings.set_input_enabled("gmail", False)
 
     def fake_connect(path):
         seen.append(path)
@@ -120,9 +114,48 @@ def test_gmail_connect_prints_connected_account(monkeypatch, capsys):
     )
 
     assert seen == [Path("/tmp/client.json")]
+    assert input_settings.input_is_enabled("gmail") is True
     output = capsys.readouterr().out
     assert "Gmail connected: person@example.com" in output
     assert "cannot modify or send email" in output
+
+
+def test_gmail_connect_reports_success_before_auto_enable_warning(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        connections_gmail,
+        "connect_gmail",
+        lambda _path: GmailProfile(
+            email_address="person@example.com",
+            history_id="123",
+        ),
+    )
+    monkeypatch.setattr(
+        connections_gmail,
+        "set_input_enabled",
+        lambda *_args: (_ for _ in ()).throw(
+            input_settings.InputSettingsError("settings unavailable")
+        ),
+    )
+
+    assert (
+        main(
+            [
+                "connections",
+                "gmail",
+                "connect",
+                "--credentials",
+                "/tmp/client.json",
+            ]
+        )
+        == 1
+    )
+
+    output = capsys.readouterr()
+    assert "Gmail connected: person@example.com" in output.out
+    assert "Warning: Gmail is connected" in output.err
 
 
 def test_gmail_fetch_missing_connection_returns_nonzero(monkeypatch, capsys):
@@ -351,8 +384,40 @@ def test_gmail_status_reports_dead_letter_count(monkeypatch, capsys):
 
     assert main(["connections", "gmail", "status"]) == 0
     assert capsys.readouterr().out == (
-        "Gmail is connected: person@example.com\nDead-letter queue: 2 messages.\n"
+        "Gmail is connected: person@example.com\n"
+        "Automatic watch: enabled.\n"
+        "Dead-letter queue: 2 messages.\n"
     )
+
+
+def test_gmail_can_be_paused_and_enabled_without_reconnecting(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        connections_gmail,
+        "gmail_status",
+        lambda: GmailStatus(connected=True, email_address="person@example.com"),
+    )
+
+    assert main(["connections", "gmail", "disable"]) == 0
+    assert input_settings.input_is_enabled("gmail") is False
+    assert "remains connected" in capsys.readouterr().out
+
+    assert main(["connections", "gmail", "enable"]) == 0
+    assert input_settings.input_is_enabled("gmail") is True
+    assert "automatic watching enabled" in capsys.readouterr().out
+
+
+def test_gmail_cannot_be_enabled_before_it_is_connected(monkeypatch, capsys):
+    monkeypatch.setattr(
+        connections_gmail,
+        "gmail_status",
+        lambda: GmailStatus(connected=False),
+    )
+
+    assert main(["connections", "gmail", "enable"]) == 1
+    assert "connect Gmail" in capsys.readouterr().err
 
 
 def test_interactive_menu_dispatches_gmail_selection(monkeypatch, capsys):
@@ -373,14 +438,15 @@ def test_interactive_menu_dispatches_gmail_selection(monkeypatch, capsys):
 
     output = capsys.readouterr().out
     assert "1. Gmail" in output
-    assert "2. Telegram" in output
-    assert "3. Discord" in output
+    assert "2. Discord" in output
+    assert "3. Watch all active inputs" in output
+    assert "Telegram" not in output
     assert "Agent Sherlock Gmail" in output
     assert "Gmail is connected: person@example.com" in output
 
 
 def test_interactive_menu_opens_discord_menu(monkeypatch, capsys):
-    choices = iter(["3", "3"])
+    choices = iter(["2", "3"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(choices))
     monkeypatch.setattr(
         connections_discord,
@@ -402,58 +468,37 @@ def test_interactive_menu_opens_discord_menu(monkeypatch, capsys):
     assert "@sherlock_bot watching #alerts (9)" in output
 
 
-def test_telegram_connect_reads_token_file(monkeypatch, tmp_path, capsys):
-    token_file = tmp_path / "telegram-token"
-    token_file.write_text("123456:abcdefghijklmnopqrstuvwxyz")
-    seen = []
+def test_thread_safe_terminal_writes_do_not_overlap():
+    class SlowStream:
+        def __init__(self):
+            self.active = False
+            self.overlapped = False
+            self.lines = []
+            self.state_lock = threading.Lock()
 
-    def fake_connect(token, **kwargs):
-        seen.append((token, kwargs["chat_id"]))
-        return TelegramStatus(connected=True, bot_username="sherlock_bot", chat_id=7)
+        def write(self, value):
+            with self.state_lock:
+                if self.active:
+                    self.overlapped = True
+                self.active = True
+            time.sleep(0.002)
+            self.lines.append(value)
+            with self.state_lock:
+                self.active = False
 
-    monkeypatch.setattr(connections_telegram, "connect_telegram", fake_connect)
+    stream = SlowStream()
+    start = threading.Barrier(8)
 
-    assert (
-        main(
-            [
-                "connections",
-                "telegram",
-                "connect",
-                "--token-file",
-                str(token_file),
-                "--chat-id",
-                "7",
-            ]
-        )
-        == 0
-    )
+    def write_line(index):
+        start.wait()
+        connections_shared.write_terminal(f"line {index}", file=stream)
 
-    assert seen == [("123456:abcdefghijklmnopqrstuvwxyz", 7)]
-    assert "Telegram connected: @sherlock_bot" in capsys.readouterr().out
+    threads = [threading.Thread(target=write_line, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
 
-
-def test_telegram_connect_requires_secure_token_input(monkeypatch, capsys):
-    monkeypatch.setattr(
-        connections_telegram,
-        "is_interactive_terminal",
-        lambda: False,
-    )
-
-    assert main(["connections", "telegram", "connect"]) == 2
-
-    assert "--token-file" in capsys.readouterr().err
-
-
-def test_telegram_status(monkeypatch, capsys):
-    monkeypatch.setattr(
-        connections_telegram,
-        "telegram_status",
-        lambda: TelegramStatus(
-            connected=True,
-            bot_username="sherlock_bot",
-            chat_id=7,
-        ),
-    )
-
-    assert main(["connections", "telegram", "status"]) == 0
-    assert capsys.readouterr().out == "Telegram is connected: @sherlock_bot\n"
+    assert not any(thread.is_alive() for thread in threads)
+    assert stream.overlapped is False
+    assert set(stream.lines) == {f"line {index}\n" for index in range(8)}

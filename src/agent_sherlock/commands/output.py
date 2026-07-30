@@ -5,6 +5,7 @@ import getpass
 import sys
 from pathlib import Path
 
+from agent_sherlock.commands import output_telegram
 from agent_sherlock.commands.base import Command
 from agent_sherlock.commands.connections_shared import (
     is_interactive_terminal,
@@ -62,6 +63,8 @@ def configure(parser: argparse.ArgumentParser) -> None:
     )
     test.set_defaults(output_handler=run_test)
 
+    output_telegram.configure(actions)
+
     discord = actions.add_parser(
         "discord",
         help="Manage the Discord webhook output.",
@@ -90,6 +93,9 @@ def run(args: argparse.Namespace) -> int:
         return handler(args)
 
     if is_interactive_terminal():
+        output_menu = getattr(args, "output_menu", None)
+        if output_menu is not None:
+            return output_menu()
         return run_menu()
 
     parser = getattr(args, "output_parser", None)
@@ -100,21 +106,23 @@ def run(args: argparse.Namespace) -> int:
 
 def run_menu() -> int:
     print("Agent Sherlock output")
-    print("  1. Show output status")
+    print("  1. Manage Telegram output")
     print("  2. Deliver to Telegram")
     print("  3. Deliver to Discord")
     print("  4. Connect Discord webhook")
-    print("  5. Send test message")
+    print("  5. Show output status")
+    print("  6. Send test message")
     print("  q. Quit")
 
     handlers = {
-        "1": lambda: run_status(argparse.Namespace()),
+        "1": output_telegram.run_menu,
         "2": lambda: run_use(argparse.Namespace(destination="telegram")),
         "3": lambda: run_use(argparse.Namespace(destination="discord")),
         "4": lambda: run_discord_connect(
             argparse.Namespace(webhook_url_file=None),
         ),
-        "5": lambda: run_test(argparse.Namespace()),
+        "5": lambda: run_status(argparse.Namespace()),
+        "6": lambda: run_test(argparse.Namespace()),
     }
     while True:
         choice = read_menu_choice()
@@ -123,7 +131,7 @@ def run_menu() -> int:
         handler = handlers.get(choice)
         if handler is not None:
             return handler()
-        print("Choose 1, 2, 3, 4, 5, or q.")
+        print("Choose 1, 2, 3, 4, 5, 6, or q.")
 
 
 def _webhook_url_from_args(args: argparse.Namespace) -> str | None:

@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from agent_sherlock import input_settings
 from agent_sherlock.application import PendingDeliveryError, PipelineError, SyncResult
 from agent_sherlock.cli import main
 from agent_sherlock.commands import connections, connections_discord
@@ -51,12 +52,15 @@ def test_discord_without_action_prints_help(monkeypatch, capsys):
     assert "connect" in output
     assert "watch" in output
     assert "status" in output
+    assert "enable" in output
+    assert "disable" in output
 
 
 def test_discord_connect_reads_token_file(monkeypatch, tmp_path, capsys):
     token_file = tmp_path / "discord-token"
     token_file.write_text(TOKEN)
     seen = []
+    input_settings.set_input_enabled("discord", False)
 
     def fake_connect(token, *, channel_id):
         seen.append((token, channel_id))
@@ -86,7 +90,54 @@ def test_discord_connect_reads_token_file(monkeypatch, tmp_path, capsys):
     )
 
     assert seen == [(TOKEN, 9)]
+    assert input_settings.input_is_enabled("discord") is True
     assert "@sherlock_bot watching #alerts (9)" in capsys.readouterr().out
+
+
+def test_discord_connect_reports_success_before_auto_enable_warning(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    token_file = tmp_path / "discord-token"
+    token_file.write_text(TOKEN)
+    monkeypatch.setattr(
+        connections_discord,
+        "connect_discord",
+        lambda _token, *, channel_id: DiscordStatus(
+            connected=True,
+            bot_username="sherlock_bot",
+            guild_id=8,
+            channel_id=channel_id,
+            channel_name="alerts",
+        ),
+    )
+    monkeypatch.setattr(
+        connections_discord,
+        "set_input_enabled",
+        lambda *_args: (_ for _ in ()).throw(
+            input_settings.InputSettingsError("settings unavailable")
+        ),
+    )
+
+    assert (
+        main(
+            [
+                "connections",
+                "discord",
+                "connect",
+                "--token-file",
+                str(token_file),
+                "--channel-id",
+                "9",
+            ]
+        )
+        == 1
+    )
+
+    output = capsys.readouterr()
+    assert "Discord connected: @sherlock_bot watching #alerts (9)" in output.out
+    assert "Warning: Discord is connected" in output.err
 
 
 def test_discord_connect_requires_secure_inputs(monkeypatch, capsys):
@@ -121,8 +172,45 @@ def test_discord_status(monkeypatch, capsys):
     assert main(["connections", "discord", "status"]) == 0
     assert capsys.readouterr().out == (
         "Discord is connected: @sherlock_bot watching #alerts (9).\n"
+        "Automatic watch: enabled.\n"
         "Dead-letter queue: 2 messages.\n"
     )
+
+
+def test_discord_can_be_paused_and_enabled_without_reconnecting(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        connections_discord,
+        "discord_status",
+        lambda: DiscordStatus(
+            connected=True,
+            bot_username="sherlock_bot",
+            guild_id=8,
+            channel_id=9,
+            channel_name="alerts",
+        ),
+    )
+
+    assert main(["connections", "discord", "disable"]) == 0
+    assert input_settings.input_is_enabled("discord") is False
+    assert "remains connected" in capsys.readouterr().out
+
+    assert main(["connections", "discord", "enable"]) == 0
+    assert input_settings.input_is_enabled("discord") is True
+    assert "automatic watching enabled" in capsys.readouterr().out
+
+
+def test_discord_cannot_be_enabled_before_it_is_connected(monkeypatch, capsys):
+    monkeypatch.setattr(
+        connections_discord,
+        "discord_status",
+        lambda: DiscordStatus(connected=False),
+    )
+
+    assert main(["connections", "discord", "enable"]) == 1
+    assert "connect Discord" in capsys.readouterr().err
 
 
 def test_discord_watch_ingests_gateway_message(monkeypatch, capsys):
@@ -149,8 +237,10 @@ def test_discord_watch_ingests_gateway_message(monkeypatch, capsys):
         *,
         on_ready_callback,
         on_maintenance_callback,
+        stop_event,
     ):
         assert discord_credentials == Connector.credentials
+        assert stop_event is None
         on_ready_callback()
         handler("gateway-event")
         on_maintenance_callback()
@@ -192,7 +282,9 @@ def test_discord_watch_keeps_gateway_alive_after_pipeline_errors(monkeypatch, ca
         *,
         on_ready_callback,
         on_maintenance_callback,
+        stop_event,
     ):
+        assert stop_event is None
         on_ready_callback()
         handler("gateway-event")
         on_maintenance_callback()
@@ -239,7 +331,9 @@ def test_discord_watch_explains_how_to_resolve_an_output_conflict(
         *,
         on_ready_callback,
         on_maintenance_callback,
+        stop_event,
     ):
+        assert stop_event is None
         on_ready_callback()
         handler("gateway-event")
         on_maintenance_callback()
@@ -295,6 +389,50 @@ def test_discord_watch_gateway_failure_returns_one(monkeypatch, capsys):
 
     assert main(["connections", "discord", "watch"]) == 1
     assert "Gateway unavailable" in capsys.readouterr().err
+
+
+def test_discord_custom_ready_message_is_announced_by_on_ready(
+    monkeypatch,
+    capsys,
+):
+    callback_seen = []
+
+    class Connector:
+        credentials = credentials()
+
+    class Pipeline:
+        pass
+
+    def fake_watch(
+        _credentials,
+        _handler,
+        *,
+        on_ready_callback,
+        on_maintenance_callback,
+        stop_event,
+    ):
+        assert on_maintenance_callback is not None
+        assert stop_event is not None
+        assert "✓ Discord" not in capsys.readouterr().out
+        on_ready_callback()
+        callback_seen.append(True)
+
+    monkeypatch.setattr(connections_discord, "watch_discord", fake_watch)
+
+    assert (
+        connections_discord.watch_connected_discord(
+            Connector(),
+            Pipeline(),
+            destination_name="telegram",
+            stop_event=type("StopEvent", (), {})(),
+            ready_message="✓ Discord: watching #alerts",
+            announce_stop=False,
+        )
+        == 0
+    )
+
+    assert callback_seen == [True]
+    assert capsys.readouterr().out == "✓ Discord: watching #alerts\n"
 
 
 def test_interactive_channel_id_rejects_invalid_input(monkeypatch):

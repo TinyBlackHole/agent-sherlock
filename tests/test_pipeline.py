@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import stat
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -235,6 +236,37 @@ def test_streaming_connector_can_ingest_normalized_messages(tmp_path):
     result = pipeline.ingest((inbound_message("discord-1"),))
 
     assert result == SyncResult(discovered=1, stored=1, delivered=1)
+    assert len(destination.messages) == 1
+
+
+def test_one_pipeline_serializes_concurrent_delivery_attempts(tmp_path):
+    delivery_started = threading.Event()
+    release_delivery = threading.Event()
+
+    class SlowDestination(FakeDestination):
+        def send(self, text):
+            delivery_started.set()
+            assert release_delivery.wait(timeout=1)
+            super().send(text)
+
+    repository = MessageRepository(tmp_path / "sherlock.db")
+    repository.add((inbound_message(),))
+    destination = SlowDestination()
+    pipeline = MessagePipeline(repository, destination)
+    results = []
+
+    first = threading.Thread(target=lambda: results.append(pipeline.deliver_pending()))
+    second = threading.Thread(target=lambda: results.append(pipeline.deliver_pending()))
+    first.start()
+    assert delivery_started.wait(timeout=1)
+    second.start()
+    release_delivery.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert sorted(result.delivered for result in results) == [0, 1]
     assert len(destination.messages) == 1
 
 

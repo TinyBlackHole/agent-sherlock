@@ -303,6 +303,37 @@ def test_watch_discord_requests_minimal_intents_and_dispatches_messages():
     assert clients[0].max_messages is None
 
 
+def test_watch_discord_stops_when_the_supervisor_requests_shutdown():
+    stop_event = threading.Event()
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.user = SimpleNamespace(id=42)
+            self.closed = False
+
+        def run(self, *_args, **_kwargs):
+            async def dispatch():
+                await self.setup_hook()
+                await self.on_ready()
+                stop_event.set()
+                await asyncio.wait_for(self._shutdown_task, timeout=1)
+
+            asyncio.run(dispatch())
+
+        async def close(self):
+            self.closed = True
+
+        def is_closed(self):
+            return self.closed
+
+    discord.watch_discord(
+        credentials(),
+        lambda _message: None,
+        stop_event=stop_event,
+        discord_module=_gateway_module(FakeClient),
+    )
+
+
 def _gateway_module(client_type, *, login_failure=None, privileged_intents=None):
     class FakeIntents:
         @classmethod

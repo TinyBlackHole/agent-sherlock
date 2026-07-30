@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -14,10 +15,14 @@ from agent_sherlock.application import (
     SyncResult,
 )
 from agent_sherlock.commands.connections_shared import (
+    automatic_watch_status,
+    disable_automatic_watch,
+    enable_automatic_watch,
     is_interactive_terminal,
     print_error,
     read_menu_choice,
     terminal_safe,
+    write_terminal,
 )
 from agent_sherlock.connectors.gmail import GmailConnector
 from agent_sherlock.destinations.active import (
@@ -25,6 +30,11 @@ from agent_sherlock.destinations.active import (
     DESTINATION_ERRORS,
     ActiveDestination,
     active_destination_name,
+)
+from agent_sherlock.input_settings import (
+    InputSettingsError,
+    input_is_enabled,
+    set_input_enabled,
 )
 from agent_sherlock.integrations.gmail import (
     GmailAPIError,
@@ -103,6 +113,20 @@ def configure(providers: argparse._SubParsersAction) -> None:
     )
     status.set_defaults(connection_handler=run_status)
 
+    enable = actions.add_parser(
+        "enable",
+        help="Include Gmail in the automatic watcher.",
+        description="Include Gmail when `sherlock watch` starts connected inputs.",
+    )
+    enable.set_defaults(connection_handler=run_enable)
+
+    disable = actions.add_parser(
+        "disable",
+        help="Pause automatic Gmail watching without disconnecting it.",
+        description="Pause automatic Gmail watching without removing credentials.",
+    )
+    disable.set_defaults(connection_handler=run_disable)
+
 
 def run_menu() -> int:
     print("Agent Sherlock Gmail")
@@ -110,6 +134,8 @@ def run_menu() -> int:
     print("  2. Fetch new Gmail messages")
     print("  3. Watch for new Gmail messages")
     print("  4. Show Gmail status")
+    print("  5. Enable automatic watching")
+    print("  6. Pause automatic watching")
     print("  q. Quit")
 
     handlers = {
@@ -122,6 +148,8 @@ def run_menu() -> int:
             )
         ),
         "4": lambda: run_status(argparse.Namespace()),
+        "5": lambda: run_enable(argparse.Namespace()),
+        "6": lambda: run_disable(argparse.Namespace()),
     }
     while True:
         choice = read_menu_choice()
@@ -130,7 +158,7 @@ def run_menu() -> int:
         handler = handlers.get(choice)
         if handler is not None:
             return handler()
-        print("Choose 1, 2, 3, 4, or q.")
+        print("Choose 1, 2, 3, 4, 5, 6, or q.")
 
 
 def _credentials_path_from_args(args: argparse.Namespace) -> Path | None:
@@ -167,6 +195,16 @@ def run_connect(args: argparse.Namespace) -> int:
 
     print(f"Gmail connected: {terminal_safe(profile.email_address)}")
     print("Incoming email can be read; Sherlock cannot modify or send email.")
+    try:
+        set_input_enabled("gmail", True)
+    except InputSettingsError as exc:
+        print(
+            "Warning: Gmail is connected, but automatic watching could not be "
+            f"enabled: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
     return 0
 
 
@@ -188,7 +226,7 @@ def _print_sync_result(
             )
         )
         if should_print:
-            print(
+            write_terminal(
                 json.dumps(
                     {
                         "delivered": result.delivered,
@@ -199,18 +237,18 @@ def _print_sync_result(
                         "stored": result.stored,
                     },
                     sort_keys=True,
-                )
+                ),
             )
         return
 
     if result.initialized:
-        print(
+        write_terminal(
             "Gmail baseline saved. Future messages will be sent to the "
             "configured output."
         )
         return
     if result.history_reset:
-        print(
+        write_terminal(
             "Gmail history was no longer available. A new baseline was saved; "
             "messages from the history gap cannot be identified safely.",
             file=sys.stderr,
@@ -218,10 +256,10 @@ def _print_sync_result(
         return
     if result.delivered:
         noun = "message" if result.delivered == 1 else "messages"
-        print(f"Sent {result.delivered} {noun} to the configured output.")
+        write_terminal(f"Sent {result.delivered} {noun} to the configured output.")
     if result.dead_lettered:
         noun = "message" if result.dead_lettered == 1 else "messages"
-        print(
+        write_terminal(
             f"Warning: moved {result.dead_lettered} {noun} to the dead-letter "
             "queue after repeated delivery failures.",
             file=sys.stderr,
@@ -230,10 +268,10 @@ def _print_sync_result(
         return
     if not result.discovered:
         if not quiet_when_empty:
-            print("No new Gmail messages.")
+            write_terminal("No new Gmail messages.")
         return
     if not quiet_when_empty:
-        print("Gmail messages were already queued or delivered.")
+        write_terminal("Gmail messages were already queued or delivered.")
 
 
 def _open_pipeline() -> tuple[GmailConnector, MessagePipeline]:
@@ -257,7 +295,7 @@ def run_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_interval(interval: float) -> bool:
+def validate_interval(interval: float) -> bool:
     if not math.isfinite(interval) or interval <= 0:
         print(
             "Error: --interval must be a finite number greater than 0.",
@@ -288,7 +326,7 @@ def _retry_delay(
 
 
 def run_watch(args: argparse.Namespace) -> int:
-    if not _validate_interval(args.interval):
+    if not validate_interval(args.interval):
         return 2
 
     try:
@@ -305,9 +343,26 @@ def run_watch(args: argparse.Namespace) -> int:
             f"{args.interval:g} seconds. Press Ctrl+C to stop."
         )
 
+    return watch_connected_gmail(
+        connector,
+        pipeline,
+        interval=args.interval,
+        json_output=json_output,
+    )
+
+
+def watch_connected_gmail(
+    connector: GmailConnector,
+    pipeline: MessagePipeline,
+    *,
+    interval: float,
+    json_output: bool = False,
+    stop_event: threading.Event | None = None,
+) -> int:
+    """Watch an already opened Gmail input until interrupted or stopped."""
     consecutive_errors = 0
     try:
-        while True:
+        while stop_event is None or not stop_event.is_set():
             try:
                 result = pipeline.sync(connector)
                 _print_sync_result(
@@ -316,15 +371,15 @@ def run_watch(args: argparse.Namespace) -> int:
                     quiet_when_empty=True,
                 )
                 consecutive_errors = 0
-                delay = args.interval
+                delay = interval
             except PendingDeliveryError as exc:
                 consecutive_errors += 1
                 delay = _retry_delay(
                     exc,
-                    interval=args.interval,
+                    interval=interval,
                     consecutive_errors=consecutive_errors,
                 )
-                print(
+                write_terminal(
                     f"Error: {exc} Delivery remains queued; retrying in "
                     f"{delay:g} seconds.",
                     file=sys.stderr,
@@ -336,10 +391,10 @@ def run_watch(args: argparse.Namespace) -> int:
                 consecutive_errors += 1
                 delay = _retry_delay(
                     exc,
-                    interval=args.interval,
+                    interval=interval,
                     consecutive_errors=consecutive_errors,
                 )
-                print(
+                write_terminal(
                     f"Error: {exc} Retrying in {delay:g} seconds.",
                     file=sys.stderr,
                 )
@@ -351,11 +406,16 @@ def run_watch(args: argparse.Namespace) -> int:
             ) as exc:
                 print_error(exc)
                 return 1
-            time.sleep(delay)
+            if stop_event is not None:
+                if stop_event.wait(delay):
+                    break
+            else:
+                time.sleep(delay)
     except KeyboardInterrupt:
         if not json_output:
-            print("Stopped Gmail watch.")
+            write_terminal("Stopped Gmail watch.")
         return 0
+    return 0
 
 
 def _status_message(status: GmailStatus) -> str:
@@ -370,10 +430,25 @@ def run_status(_args: argparse.Namespace) -> int:
     try:
         status = gmail_status()
         dead_letters = MessageRepository().dead_letter_count()
-    except (GmailError, PersistenceError) as exc:
+        enabled = input_is_enabled("gmail")
+    except (GmailError, InputSettingsError, PersistenceError) as exc:
         print_error(exc)
         return 1
     print(_status_message(status))
+    print(automatic_watch_status(connected=status.connected, enabled=enabled))
     noun = "message" if dead_letters == 1 else "messages"
     print(f"Dead-letter queue: {dead_letters} {noun}.")
     return 0
+
+
+def run_enable(_args: argparse.Namespace) -> int:
+    return enable_automatic_watch(
+        "gmail",
+        "Gmail",
+        is_connected=lambda: gmail_status().connected,
+        provider_errors=(GmailError,),
+    )
+
+
+def run_disable(_args: argparse.Namespace) -> int:
+    return disable_automatic_watch("gmail", "Gmail")

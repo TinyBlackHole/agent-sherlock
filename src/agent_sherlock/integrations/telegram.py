@@ -273,7 +273,7 @@ def load_telegram_credentials(
     selected_paths = paths or TelegramPaths.default()
     if not selected_paths.credentials.exists():
         raise TelegramAuthenticationError(
-            "Telegram is not connected. Run `sherlock connections telegram connect`."
+            "Telegram is not connected. Run `sherlock output telegram connect`."
         )
     try:
         data = read_json_object(selected_paths.credentials, private=True)

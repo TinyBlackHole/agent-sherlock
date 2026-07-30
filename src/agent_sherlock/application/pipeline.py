@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -94,6 +95,7 @@ class MessagePipeline:
         self.repository = repository
         self.destination = destination
         self.processor = processor or PlainMessageProcessor()
+        self._delivery_lock = threading.Lock()
 
     def sync(self, connector: PollingConnector) -> SyncResult:
         batch = connector.poll()
@@ -125,6 +127,10 @@ class MessagePipeline:
         )
 
     def deliver_pending(self, *, limit: int = 100) -> DeliveryResult:
+        with self._delivery_lock:
+            return self._deliver_pending(limit=limit)
+
+    def _deliver_pending(self, *, limit: int) -> DeliveryResult:
         delivered = 0
         dead_lettered = 0
         for stored_message in self.repository.pending(limit=limit):

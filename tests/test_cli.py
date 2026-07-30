@@ -23,7 +23,9 @@ def test_long_version(capsys):
 
 def test_no_command_prints_help(capsys):
     assert main([]) == 0
-    assert "usage: sherlock" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "usage: sherlock" in output
+    assert "watch" in output
 
 
 def _ping_command(exit_code: int = 0) -> tuple[Command, list[argparse.Namespace]]:

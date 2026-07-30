@@ -5,13 +5,13 @@ import argparse
 from agent_sherlock.commands import (
     connections_discord,
     connections_gmail,
-    connections_telegram,
 )
 from agent_sherlock.commands.base import Command
 from agent_sherlock.commands.connections_shared import (
     is_interactive_terminal,
     read_menu_choice,
 )
+from agent_sherlock.commands.watch import run as run_all_inputs
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
@@ -19,7 +19,6 @@ def configure(parser: argparse.ArgumentParser) -> None:
     providers = parser.add_subparsers(dest="provider", metavar="<provider>")
     connections_discord.configure(providers)
     connections_gmail.configure(providers)
-    connections_telegram.configure(providers)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -46,14 +45,14 @@ def run(args: argparse.Namespace) -> int:
 def run_interactive_menu() -> int:
     print("Agent Sherlock connections")
     print("  1. Gmail")
-    print("  2. Telegram")
-    print("  3. Discord")
+    print("  2. Discord")
+    print("  3. Watch all active inputs")
     print("  q. Quit")
 
     handlers = {
         "1": connections_gmail.run_menu,
-        "2": connections_telegram.run_menu,
-        "3": connections_discord.run_menu,
+        "2": connections_discord.run_menu,
+        "3": _run_all_inputs,
     }
     while True:
         choice = read_menu_choice()
@@ -65,9 +64,17 @@ def run_interactive_menu() -> int:
         print("Choose 1, 2, 3, or q.")
 
 
+def _run_all_inputs() -> int:
+    return run_all_inputs(
+        argparse.Namespace(
+            interval=connections_gmail.DEFAULT_POLL_INTERVAL_SECONDS,
+        )
+    )
+
+
 COMMAND = Command(
     name="connections",
-    help="Connect message inputs and the Telegram output.",
+    help="Connect and watch message inputs.",
     handler=run,
     configure=configure,
 )

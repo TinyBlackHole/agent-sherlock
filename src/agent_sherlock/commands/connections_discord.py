@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import sys
+import threading
 from functools import partial
 from pathlib import Path
 
@@ -12,10 +13,14 @@ from agent_sherlock.application import (
     PipelineError,
 )
 from agent_sherlock.commands.connections_shared import (
+    automatic_watch_status,
+    disable_automatic_watch,
+    enable_automatic_watch,
     is_interactive_terminal,
     print_error,
     read_menu_choice,
     terminal_safe,
+    write_terminal,
 )
 from agent_sherlock.connectors.discord import DiscordConnector
 from agent_sherlock.destinations.active import (
@@ -24,6 +29,11 @@ from agent_sherlock.destinations.active import (
     active_destination_name,
 )
 from agent_sherlock.destinations.discord import DiscordDestination
+from agent_sherlock.input_settings import (
+    InputSettingsError,
+    input_is_enabled,
+    set_input_enabled,
+)
 from agent_sherlock.integrations.discord import (
     DiscordConfigurationError,
     DiscordError,
@@ -77,18 +87,36 @@ def configure(providers: argparse._SubParsersAction) -> None:
     )
     status.set_defaults(connection_handler=run_status)
 
+    enable = actions.add_parser(
+        "enable",
+        help="Include Discord in the automatic watcher.",
+        description="Include Discord when `sherlock watch` starts connected inputs.",
+    )
+    enable.set_defaults(connection_handler=run_enable)
+
+    disable = actions.add_parser(
+        "disable",
+        help="Pause automatic Discord watching without disconnecting it.",
+        description="Pause automatic Discord watching without removing credentials.",
+    )
+    disable.set_defaults(connection_handler=run_disable)
+
 
 def run_menu() -> int:
     print("Agent Sherlock Discord")
     print("  1. Connect Discord")
     print("  2. Watch for new Discord messages")
     print("  3. Show Discord status")
+    print("  4. Enable automatic watching")
+    print("  5. Pause automatic watching")
     print("  q. Quit")
 
     handlers = {
         "1": lambda: run_connect(argparse.Namespace(token_file=None, channel_id=None)),
         "2": lambda: run_watch(argparse.Namespace()),
         "3": lambda: run_status(argparse.Namespace()),
+        "4": lambda: run_enable(argparse.Namespace()),
+        "5": lambda: run_disable(argparse.Namespace()),
     }
     while True:
         choice = read_menu_choice()
@@ -97,7 +125,7 @@ def run_menu() -> int:
         handler = handlers.get(choice)
         if handler is not None:
             return handler()
-        print("Choose 1, 2, 3, or q.")
+        print("Choose 1, 2, 3, 4, 5, or q.")
 
 
 def _token_from_args(args: argparse.Namespace) -> str | None:
@@ -168,6 +196,16 @@ def run_connect(args: argparse.Namespace) -> int:
         f"Discord connected: @{terminal_safe(status.bot_username)} watching "
         f"#{terminal_safe(status.channel_name)} ({status.channel_id})."
     )
+    try:
+        set_input_enabled("discord", True)
+    except InputSettingsError as exc:
+        print(
+            "Warning: Discord is connected, but automatic watching could not be "
+            f"enabled: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
     return 0
 
 
@@ -175,13 +213,13 @@ def _open_pipeline() -> tuple[DiscordConnector, MessagePipeline]:
     credentials = load_discord_credentials()
     connector = DiscordConnector(credentials)
     destination = ActiveDestination.open(
-        validator=partial(_reject_delivery_loop, credentials.channel_id),
+        validator=partial(reject_delivery_loop, credentials.channel_id),
     )
     pipeline = MessagePipeline(MessageRepository(), destination)
     return connector, pipeline
 
 
-def _reject_delivery_loop(watched_channel_id: int, destination: object) -> None:
+def reject_delivery_loop(watched_channel_id: int, destination: object) -> None:
     """Refuse to watch the same channel the Discord output posts into.
 
     Delivered messages would be read back as new input and forwarded again,
@@ -206,13 +244,31 @@ def run_watch(_args: argparse.Namespace) -> int:
         print_error(exc)
         return 1
 
+    return watch_connected_discord(
+        connector,
+        pipeline,
+        destination_name=destination_name,
+    )
+
+
+def watch_connected_discord(
+    connector: DiscordConnector,
+    pipeline: MessagePipeline,
+    *,
+    destination_name: str,
+    stop_event: threading.Event | None = None,
+    ready_message: str | None = None,
+    announce_stop: bool = True,
+) -> int:
+    """Watch an already opened Discord input until the Gateway stops."""
     credentials = connector.credentials
+    message_when_ready = ready_message or (
+        f"Forwarding Discord #{terminal_safe(credentials.channel_name)} "
+        f"to {destination_name}. Press Ctrl+C to stop."
+    )
 
     def on_ready() -> None:
-        print(
-            f"Forwarding Discord #{terminal_safe(credentials.channel_name)} "
-            f"to {destination_name}. Press Ctrl+C to stop."
-        )
+        write_terminal(message_when_ready)
 
     def on_message(message: object) -> None:
         normalized = connector.normalize(message)
@@ -224,7 +280,7 @@ def run_watch(_args: argparse.Namespace) -> int:
             _print_pending_delivery_error(exc)
             return
         except (PersistenceError, PipelineError) as exc:
-            print(
+            write_terminal(
                 f"Error: {exc} Discord watch remains connected; queued work "
                 "will be retried.",
                 file=sys.stderr,
@@ -242,7 +298,7 @@ def run_watch(_args: argparse.Namespace) -> int:
             _print_pending_delivery_error(exc)
             return
         except (PersistenceError, PipelineError) as exc:
-            print(
+            write_terminal(
                 f"Error: {exc} Discord watch remains connected; queued delivery "
                 "will be retried.",
                 file=sys.stderr,
@@ -259,11 +315,13 @@ def run_watch(_args: argparse.Namespace) -> int:
             on_message,
             on_ready_callback=on_ready,
             on_maintenance_callback=on_maintenance,
+            stop_event=stop_event,
         )
     except (DiscordError, *DESTINATION_ERRORS, PersistenceError, PipelineError) as exc:
         print_error(exc)
         return 1
-    print("Stopped Discord watch.")
+    if announce_stop:
+        write_terminal("Stopped Discord watch.")
     return 0
 
 
@@ -275,16 +333,16 @@ def _print_pending_delivery_error(exception: PendingDeliveryError) -> None:
         )
     else:
         guidance = " Queued delivery will be retried."
-    print(f"Error: {exception}{guidance}", file=sys.stderr)
+    write_terminal(f"Error: {exception}{guidance}", file=sys.stderr)
 
 
 def _print_delivery_result(*, delivered: int, dead_lettered: int) -> None:
     if delivered:
         noun = "message" if delivered == 1 else "messages"
-        print(f"Sent {delivered} queued {noun} to the configured output.")
+        write_terminal(f"Sent {delivered} queued {noun} to the configured output.")
     if dead_lettered:
         noun = "message" if dead_lettered == 1 else "messages"
-        print(
+        write_terminal(
             f"Warning: moved {dead_lettered} {noun} to the dead-letter queue.",
             file=sys.stderr,
         )
@@ -303,10 +361,25 @@ def run_status(_args: argparse.Namespace) -> int:
     try:
         status = discord_status()
         dead_letters = MessageRepository().dead_letter_count()
-    except (DiscordError, PersistenceError) as exc:
+        enabled = input_is_enabled("discord")
+    except (DiscordError, InputSettingsError, PersistenceError) as exc:
         print_error(exc)
         return 1
     print(_status_message(status))
+    print(automatic_watch_status(connected=status.connected, enabled=enabled))
     noun = "message" if dead_letters == 1 else "messages"
     print(f"Dead-letter queue: {dead_letters} {noun}.")
     return 0
+
+
+def run_enable(_args: argparse.Namespace) -> int:
+    return enable_automatic_watch(
+        "discord",
+        "Discord",
+        is_connected=lambda: discord_status().connected,
+        provider_errors=(DiscordError,),
+    )
+
+
+def run_disable(_args: argparse.Namespace) -> int:
+    return disable_automatic_watch("discord", "Discord")

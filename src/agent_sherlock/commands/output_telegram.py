@@ -23,13 +23,13 @@ from agent_sherlock.integrations.telegram import (
 MAX_TOKEN_FILE_BYTES = 4_096
 
 
-def configure(providers: argparse._SubParsersAction) -> None:
-    telegram = providers.add_parser(
+def configure(outputs: argparse._SubParsersAction) -> None:
+    telegram = outputs.add_parser(
         "telegram",
-        help="Connect the private Telegram output.",
-        description="Connect the private Telegram output.",
+        help="Manage the private Telegram output.",
+        description="Manage the private Telegram output.",
     )
-    telegram.set_defaults(provider_parser=telegram, provider_menu=run_menu)
+    telegram.set_defaults(output_parser=telegram, output_menu=run_menu)
     actions = telegram.add_subparsers(dest="action", metavar="<action>")
 
     connect = actions.add_parser(
@@ -52,25 +52,25 @@ def configure(providers: argparse._SubParsersAction) -> None:
             "one-time authorization link."
         ),
     )
-    connect.set_defaults(connection_handler=run_connect)
+    connect.set_defaults(output_handler=run_connect)
 
     test = actions.add_parser(
         "test",
         help="Send a test message to the configured Telegram chat.",
         description="Send a test message to the configured Telegram chat.",
     )
-    test.set_defaults(connection_handler=run_test)
+    test.set_defaults(output_handler=run_test)
 
     status = actions.add_parser(
         "status",
         help="Show the local Telegram connection status.",
         description="Show the local Telegram connection status.",
     )
-    status.set_defaults(connection_handler=run_status)
+    status.set_defaults(output_handler=run_status)
 
 
 def run_menu() -> int:
-    print("Agent Sherlock Telegram")
+    print("Agent Sherlock Telegram output")
     print("  1. Connect Telegram")
     print("  2. Send test message")
     print("  3. Show Telegram status")

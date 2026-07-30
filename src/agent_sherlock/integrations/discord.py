@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.client import HTTPException, HTTPSConnection
@@ -341,6 +342,7 @@ def watch_discord(
     on_ready_callback: Callable[[], None] | None = None,
     on_maintenance_callback: Callable[[], None] | None = None,
     maintenance_interval: float = DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    stop_event: threading.Event | None = None,
     discord_module: Any | None = None,
 ) -> None:
     """Run a Discord Gateway client and hand new events to a sync callback."""
@@ -362,6 +364,7 @@ def watch_discord(
             self._announced_ready = False
             self._ready_event: asyncio.Event | None = None
             self._maintenance_task: asyncio.Task[None] | None = None
+            self._shutdown_task: asyncio.Task[None] | None = None
 
         async def setup_hook(self) -> None:
             self._ingest_lock = asyncio.Lock()
@@ -370,6 +373,11 @@ def watch_discord(
                 self._maintenance_task = asyncio.create_task(
                     self._maintain_delivery_queue(),
                     name="sherlock-discord-maintenance",
+                )
+            if stop_event is not None:
+                self._shutdown_task = asyncio.create_task(
+                    self._watch_for_shutdown(),
+                    name="sherlock-discord-shutdown",
                 )
 
         async def on_ready(self) -> None:
@@ -422,6 +430,14 @@ def watch_discord(
                     await self.close()
                     return
                 await asyncio.sleep(maintenance_interval)
+
+        async def _watch_for_shutdown(self) -> None:
+            if stop_event is None:
+                return
+            while not self.is_closed() and not stop_event.is_set():
+                await asyncio.sleep(0.2)
+            if stop_event.is_set() and not self.is_closed():
+                await self.close()
 
     client = SherlockDiscordClient()
     try:

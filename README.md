@@ -47,7 +47,7 @@ Telegram is one of Sherlock's two outputs, and the default. Create a bot with
 [@BotFather](https://t.me/BotFather), then run:
 
 ```bash
-sherlock connections telegram connect
+sherlock output telegram connect
 ```
 
 The token is requested with hidden terminal input. Sherlock validates the bot
@@ -57,15 +57,15 @@ authorize that private chat.
 For non-interactive setup, place the token in a private temporary file:
 
 ```bash
-sherlock connections telegram connect --token-file /path/to/private-token
+sherlock output telegram connect --token-file /path/to/private-token
 ```
 
 The one-time link remains required unless an existing private chat is selected
 with `--chat-id`. Check the connection or send a test:
 
 ```bash
-sherlock connections telegram status
-sherlock connections telegram test
+sherlock output telegram status
+sherlock output telegram test
 ```
 
 ## Connect Gmail as an input
@@ -111,7 +111,7 @@ selected output:
 sherlock connections gmail fetch
 ```
 
-Or watch continuously in the foreground:
+To watch only Gmail for diagnosis, run:
 
 ```bash
 sherlock connections gmail watch
@@ -119,9 +119,9 @@ sherlock connections gmail watch
 
 The Gmail connection records the current mailbox history as a baseline, so
 existing messages are not replayed. The default watch interval is 30 seconds.
-Use `--interval SECONDS` to change it or `--json` on `fetch`/`watch` for an
-operational result containing counts only. Email content is delivered only to
-the selected output, never printed by these commands.
+Use `--interval SECONDS` to change it or `--json` on `fetch`/the individual
+Gmail watcher for an operational result containing counts only. Email content
+is delivered only to the selected output, never printed by these commands.
 
 Check local connection status:
 
@@ -180,7 +180,7 @@ before saving the connection. Check its local status with:
 sherlock connections discord status
 ```
 
-Start the foreground Gateway connection:
+To run only the Discord Gateway connection for diagnosis:
 
 ```bash
 sherlock connections discord watch
@@ -195,6 +195,39 @@ The bot token is stored under
 `~/.config/agent-sherlock/connections/discord/` with the same private-file
 protections as the other connections. Never commit the token, and reset it in
 the Developer Portal if it is exposed.
+
+## Watch every active input
+
+The normal way to run Sherlock is:
+
+```bash
+sherlock watch
+```
+
+Sherlock automatically discovers Gmail and Discord connections that are valid
+locally and starts all of them in one foreground process. A connection is
+enabled automatically when it is created. Inputs that are not connected are
+skipped, and one input failing does not stop the others.
+
+Pause an input without deleting its credentials, then enable it again later:
+
+```bash
+sherlock connections gmail disable
+sherlock connections gmail enable
+sherlock connections discord disable
+sherlock connections discord enable
+```
+
+Connection status shows whether automatic watching is enabled or paused.
+`sherlock watch --interval SECONDS` changes the polling interval for Gmail;
+Discord continues to receive Gateway events in real time. Press **Ctrl+C** to
+stop all inputs together. If a provider is stuck while shutting down, press
+**Ctrl+C** again to force the foreground process to exit.
+
+All workers share one durable inbox and one serialized delivery path. This
+allows inputs to receive concurrently without racing to deliver the same queued
+message. The selected output is still resolved for each delivery, so switching
+between Telegram and Discord does not require restarting `sherlock watch`.
 
 ## Choose where Sherlock delivers
 
@@ -234,8 +267,9 @@ Discord's message limit is delivered in one post with a preview and the complete
 text attached, which prevents partial posts from being duplicated on retry.
 
 If the Discord input watches the same channel the Discord output posts into,
-`sherlock connections discord watch` refuses to start: every delivered message
-would be read back as new input and forwarded again.
+both `sherlock watch` and `sherlock connections discord watch` refuse to start
+that pairing: every delivered message would be read back as new input and
+forwarded again.
 
 ## Architecture
 
@@ -248,12 +282,17 @@ selected destination delivers it.
 Gmail / Discord / future inputs
         |
         v
-InboundMessage -> SQLite inbox -> processor -> Telegram chat or Discord channel
+concurrent watchers -> InboundMessage -> SQLite inbox
+                                           |
+                                           v
+                      serialized delivery -> Telegram chat or Discord channel
 ```
 
 The active destination is stored in
 `~/.config/agent-sherlock/destination.json` and resolved through the
 `MessageDestination` protocol, so inputs never know which one is configured.
+Paused-input settings are stored in
+`~/.config/agent-sherlock/inputs.json`; connected inputs are enabled by default.
 
 The current processor forwards a safe plain-text representation. An AI provider
 can be inserted at that boundary later without coupling it to Gmail, Discord, or

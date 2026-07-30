@@ -4,7 +4,7 @@ import json
 import pytest
 
 from agent_sherlock.cli import main
-from agent_sherlock.commands import connections_discord, output
+from agent_sherlock.commands import connections_discord, output, output_telegram
 from agent_sherlock.destinations import active
 from agent_sherlock.destinations.discord import DiscordDestination
 from agent_sherlock.integrations.discord_webhook import (
@@ -115,6 +115,109 @@ def test_output_status_shows_the_active_destination_and_connections(
     assert "Active output destination: telegram" in out
     assert "telegram: connected (@sherlock_bot)" in out
     assert "discord: connected (sherlock-inbox in channel 555)" in out
+
+
+def test_telegram_without_action_prints_help(config_dir, monkeypatch, capsys):
+    monkeypatch.setattr(output, "is_interactive_terminal", lambda: False)
+
+    assert main(["output", "telegram"]) == 0
+
+    printed = capsys.readouterr().out
+    assert "usage: sherlock output telegram" in printed
+    assert "connect" in printed
+    assert "test" in printed
+    assert "status" in printed
+
+
+def test_telegram_connect_reads_token_file(
+    config_dir,
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    token_file = tmp_path / "telegram-token"
+    token_file.write_text("123456:abcdefghijklmnopqrstuvwxyz")
+    seen = []
+
+    def fake_connect(token, **kwargs):
+        seen.append((token, kwargs["chat_id"]))
+        return TelegramStatus(connected=True, bot_username="sherlock_bot", chat_id=7)
+
+    monkeypatch.setattr(output_telegram, "connect_telegram", fake_connect)
+
+    assert (
+        main(
+            [
+                "output",
+                "telegram",
+                "connect",
+                "--token-file",
+                str(token_file),
+                "--chat-id",
+                "7",
+            ]
+        )
+        == 0
+    )
+
+    assert seen == [("123456:abcdefghijklmnopqrstuvwxyz", 7)]
+    assert "Telegram connected: @sherlock_bot" in capsys.readouterr().out
+
+
+def test_telegram_connect_requires_secure_token_input(
+    config_dir,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        output_telegram,
+        "is_interactive_terminal",
+        lambda: False,
+    )
+
+    assert main(["output", "telegram", "connect"]) == 2
+
+    assert "--token-file" in capsys.readouterr().err
+
+
+def test_telegram_status(config_dir, monkeypatch, capsys):
+    monkeypatch.setattr(
+        output_telegram,
+        "telegram_status",
+        lambda: TelegramStatus(
+            connected=True,
+            bot_username="sherlock_bot",
+            chat_id=7,
+        ),
+    )
+
+    assert main(["output", "telegram", "status"]) == 0
+    assert capsys.readouterr().out == "Telegram is connected: @sherlock_bot\n"
+
+
+def test_output_menu_opens_telegram_output_menu(
+    config_dir,
+    monkeypatch,
+    capsys,
+):
+    choices = iter(["1", "3"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(choices))
+    monkeypatch.setattr(
+        output_telegram,
+        "telegram_status",
+        lambda: TelegramStatus(
+            connected=True,
+            bot_username="sherlock_bot",
+            chat_id=7,
+        ),
+    )
+
+    assert output.run_menu() == 0
+
+    printed = capsys.readouterr().out
+    assert "1. Manage Telegram output" in printed
+    assert "Agent Sherlock Telegram output" in printed
+    assert "Telegram is connected: @sherlock_bot" in printed
 
 
 def test_output_discord_connect_saves_the_webhook(
@@ -243,7 +346,7 @@ def test_watching_the_discord_output_channel_is_refused(config_dir):
     )
 
     with pytest.raises(connections_discord.DiscordConfigurationError) as error:
-        connections_discord._reject_delivery_loop(555, destination)
+        connections_discord.reject_delivery_loop(555, destination)
 
     assert "back to itself" in str(error.value)
 
@@ -254,14 +357,14 @@ def test_watching_a_different_discord_channel_is_allowed(config_dir):
         client=FakeWebhookClient(),
     )
 
-    connections_discord._reject_delivery_loop(999, destination)
+    connections_discord.reject_delivery_loop(999, destination)
 
 
 def test_the_loop_guard_ignores_a_non_discord_destination(config_dir):
     class TelegramLike:
         name = "telegram"
 
-    connections_discord._reject_delivery_loop(555, TelegramLike())
+    connections_discord.reject_delivery_loop(555, TelegramLike())
 
 
 def test_dynamic_destination_rechecks_the_discord_loop_guard(
@@ -283,7 +386,7 @@ def test_dynamic_destination_rechecks_the_discord_loop_guard(
     monkeypatch.setattr(active, "open_destination", destinations.__getitem__)
 
     destination = active.ActiveDestination.open(
-        validator=lambda candidate: connections_discord._reject_delivery_loop(
+        validator=lambda candidate: connections_discord.reject_delivery_loop(
             555,
             candidate,
         )
@@ -303,7 +406,9 @@ def test_output_without_an_action_prints_help_when_not_interactive(
     monkeypatch.setattr(output, "is_interactive_terminal", lambda: False)
 
     assert main(["output"]) == 0
-    assert "usage:" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "usage:" in printed
+    assert "telegram" in printed
 
 
 def test_discord_connect_without_a_url_or_a_terminal_exits_with_a_usage_code(
