@@ -20,7 +20,12 @@ from agent_sherlock.commands.connections_shared import (
     terminal_safe,
 )
 from agent_sherlock.connectors.gmail import GmailConnector
-from agent_sherlock.destinations.telegram import TelegramDestination
+from agent_sherlock.destinations.active import (
+    DESTINATION_API_ERRORS,
+    DESTINATION_ERRORS,
+    ActiveDestination,
+    active_destination_name,
+)
 from agent_sherlock.integrations.gmail import (
     GmailAPIError,
     GmailConfigurationError,
@@ -29,10 +34,6 @@ from agent_sherlock.integrations.gmail import (
     connect_gmail,
     gmail_status,
     open_gmail_mailbox,
-)
-from agent_sherlock.integrations.telegram import (
-    TelegramAPIError,
-    TelegramError,
 )
 from agent_sherlock.persistence import MessageRepository, PersistenceError
 
@@ -65,8 +66,8 @@ def configure(providers: argparse._SubParsersAction) -> None:
 
     fetch = actions.add_parser(
         "fetch",
-        help="Fetch new Gmail messages and deliver them to Telegram.",
-        description="Fetch new Gmail messages and deliver them to Telegram.",
+        help="Fetch new Gmail messages and deliver them to the output.",
+        description="Fetch new Gmail messages and deliver them to the output.",
     )
     fetch.add_argument(
         "--json",
@@ -77,8 +78,8 @@ def configure(providers: argparse._SubParsersAction) -> None:
 
     watch = actions.add_parser(
         "watch",
-        help="Continuously forward new Gmail messages to Telegram.",
-        description="Continuously forward new Gmail messages to Telegram.",
+        help="Continuously forward new Gmail messages to the output.",
+        description="Continuously forward new Gmail messages to the output.",
     )
     watch.add_argument(
         "--interval",
@@ -203,7 +204,10 @@ def _print_sync_result(
         return
 
     if result.initialized:
-        print("Gmail baseline saved. Future messages will be sent to Telegram.")
+        print(
+            "Gmail baseline saved. Future messages will be sent to the "
+            "configured output."
+        )
         return
     if result.history_reset:
         print(
@@ -214,7 +218,7 @@ def _print_sync_result(
         return
     if result.delivered:
         noun = "message" if result.delivered == 1 else "messages"
-        print(f"Sent {result.delivered} {noun} to Telegram.")
+        print(f"Sent {result.delivered} {noun} to the configured output.")
     if result.dead_lettered:
         noun = "message" if result.dead_lettered == 1 else "messages"
         print(
@@ -236,7 +240,7 @@ def _open_pipeline() -> tuple[GmailConnector, MessagePipeline]:
     connector = GmailConnector(open_gmail_mailbox())
     pipeline = MessagePipeline(
         MessageRepository(),
-        TelegramDestination.open(),
+        ActiveDestination.open(),
     )
     return connector, pipeline
 
@@ -245,7 +249,7 @@ def run_fetch(args: argparse.Namespace) -> int:
     try:
         connector, pipeline = _open_pipeline()
         result = pipeline.sync(connector)
-    except (GmailError, TelegramError, PersistenceError, PipelineError) as exc:
+    except (GmailError, *DESTINATION_ERRORS, PersistenceError, PipelineError) as exc:
         print_error(exc)
         return 1
 
@@ -289,15 +293,16 @@ def run_watch(args: argparse.Namespace) -> int:
 
     try:
         connector, pipeline = _open_pipeline()
-    except (GmailError, TelegramError, PersistenceError) as exc:
+        destination_name = active_destination_name()
+    except (GmailError, *DESTINATION_ERRORS, PersistenceError) as exc:
         print_error(exc)
         return 1
 
     json_output = getattr(args, "json", False)
     if not json_output:
         print(
-            f"Forwarding Gmail to Telegram every {args.interval:g} seconds. "
-            "Press Ctrl+C to stop."
+            f"Forwarding Gmail to {destination_name} every "
+            f"{args.interval:g} seconds. Press Ctrl+C to stop."
         )
 
     consecutive_errors = 0
@@ -324,7 +329,7 @@ def run_watch(args: argparse.Namespace) -> int:
                     f"{delay:g} seconds.",
                     file=sys.stderr,
                 )
-            except (GmailAPIError, TelegramAPIError) as exc:
+            except (GmailAPIError, *DESTINATION_API_ERRORS) as exc:
                 if not exc.retryable:
                     print_error(exc)
                     return 1
@@ -340,7 +345,7 @@ def run_watch(args: argparse.Namespace) -> int:
                 )
             except (
                 GmailError,
-                TelegramError,
+                *DESTINATION_ERRORS,
                 PersistenceError,
                 PipelineError,
             ) as exc:

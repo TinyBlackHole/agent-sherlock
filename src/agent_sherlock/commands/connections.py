@@ -67,7 +67,7 @@ def run_interactive_menu() -> int:
 
 COMMAND = Command(
     name="connections",
-    help="Connect inputs and the private Telegram output.",
+    help="Connect message inputs and the Telegram output.",
     handler=run,
     configure=configure,
 )

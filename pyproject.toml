@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-sherlock"
 dynamic = ["version"]
-description = "Aggregate incoming service messages into one private Telegram chat."
+description = "Aggregate incoming service messages into one selected private output."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }

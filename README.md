@@ -1,7 +1,7 @@
 # Agent Sherlock
 
 A local message hub that securely reads incoming events from connected services
-and delivers them to one private Telegram chat.
+and delivers them to one selected private Telegram or Discord destination.
 
 Source: https://github.com/TinyBlackHole/agent-sherlock
 
@@ -43,7 +43,7 @@ Subcommands are invoked as `sherlock <command> [options]`.
 
 ## Connect Telegram
 
-Telegram is Sherlock's only output. Create a bot with
+Telegram is one of Sherlock's two outputs, and the default. Create a bot with
 [@BotFather](https://t.me/BotFather), then run:
 
 ```bash
@@ -104,8 +104,8 @@ The full body of each newly discovered email is stored locally as plaintext in
 SQLite until and after delivery. Sherlock protects that database with private
 filesystem permissions, but does not application-encrypt its contents.
 
-Check once for mail received since the previous check and deliver it to
-Telegram:
+Check once for mail received since the previous check and deliver it to the
+selected output:
 
 ```bash
 sherlock connections gmail fetch
@@ -121,7 +121,7 @@ The Gmail connection records the current mailbox history as a baseline, so
 existing messages are not replayed. The default watch interval is 30 seconds.
 Use `--interval SECONDS` to change it or `--json` on `fetch`/`watch` for an
 operational result containing counts only. Email content is delivered only to
-Telegram, never printed by these commands.
+the selected output, never printed by these commands.
 
 Check local connection status:
 
@@ -142,17 +142,17 @@ keeps its original mode; private directories below it are still hardened. Set
 `XDG_CONFIG_HOME` is honored.
 
 Messages are inserted into SQLite before Gmail's history checkpoint advances.
-Retryable or unclassified Telegram failures therefore remain pending without
-losing the incoming email. A repeatedly failing error that Telegram explicitly
-classifies as non-retryable is moved to durable dead-letter storage after three
-attempts so it cannot block later messages. `watch` applies backoff while those
-delivery attempts are pending. Provider event IDs prevent the same email from
-being inserted twice.
+Retryable or unclassified destination failures therefore remain pending without
+losing the incoming email. A repeatedly failing error that the selected output
+explicitly classifies as non-retryable is moved to durable dead-letter storage
+after three attempts so it cannot block later messages. `watch` applies backoff
+while those delivery attempts are pending. Provider event IDs prevent the same
+email from being inserted twice.
 
 To revoke access, remove Agent Sherlock from the third-party connections page
 of your Google Account. Never commit either the downloaded OAuth JSON or
-Sherlock's token files. Regenerate the Telegram bot token with BotFather if it is
-ever exposed.
+Sherlock's token files. Regenerate any Telegram bot token or Discord webhook
+that is ever exposed.
 
 ## Connect Discord as an input
 
@@ -188,27 +188,72 @@ sherlock connections discord watch
 
 Only messages created while `watch` is connected are received; existing channel
 history is not replayed. Text, attachment links, stickers, and basic embed
-content are normalized into the durable inbox before delivery to Telegram.
-Provider message IDs make replay after a Gateway reconnect idempotent.
+content are normalized into the durable inbox before delivery. Provider message
+IDs make replay after a Gateway reconnect idempotent.
 
 The bot token is stored under
 `~/.config/agent-sherlock/connections/discord/` with the same private-file
 protections as the other connections. Never commit the token, and reset it in
 the Developer Portal if it is exposed.
 
+## Choose where Sherlock delivers
+
+Every input is forwarded to exactly one destination. Telegram is the default;
+Discord delivers through a channel webhook.
+
+```bash
+sherlock output status
+```
+
+To deliver into Discord, create the webhook first. In the target channel open
+**Channel Settings -> Integrations -> Webhooks -> New Webhook**, copy its URL,
+then:
+
+```bash
+sherlock output discord connect --webhook-url-file /path/to/private-url
+sherlock output use discord
+sherlock output test
+```
+
+The URL is requested with hidden terminal input when `--webhook-url-file` is
+omitted from an interactive terminal. Sherlock validates it against Discord and
+records the channel before saving. Switch back at any time with
+`sherlock output use telegram`. Running Gmail and Discord watchers observe the
+new selection on their next delivery; they do not need to be restarted.
+
+A webhook needs no bot or privileged intents. The person creating it needs
+permission to manage webhooks in the channel. Its URL is a secret: anyone
+holding it can post to that channel. It is stored under
+`~/.config/agent-sherlock/connections/discord-webhook/` with the same
+private-file protections as the other connections. Delete the webhook in
+Discord if it is ever exposed.
+
+Forwarded content is posted with mentions and link previews suppressed, so an
+untrusted message body cannot ping a role or `@everyone`. Content that exceeds
+Discord's message limit is delivered in one post with a preview and the complete
+text attached, which prevents partial posts from being duplicated on retry.
+
+If the Discord input watches the same channel the Discord output posts into,
+`sherlock connections discord watch` refuses to start: every delivered message
+would be read back as new input and forwarded again.
+
 ## Architecture
 
 Every input connector converts its provider event into a common
 `InboundMessage`. The pipeline persists and deduplicates that message before
 acknowledging the provider checkpoint. A processor prepares the output, and the
-single Telegram destination delivers it.
+selected destination delivers it.
 
 ```text
 Gmail / Discord / future inputs
         |
         v
-InboundMessage -> SQLite inbox -> processor -> private Telegram chat
+InboundMessage -> SQLite inbox -> processor -> Telegram chat or Discord channel
 ```
+
+The active destination is stored in
+`~/.config/agent-sherlock/destination.json` and resolved through the
+`MessageDestination` protocol, so inputs never know which one is configured.
 
 The current processor forwards a safe plain-text representation. An AI provider
 can be inserted at that boundary later without coupling it to Gmail, Discord, or

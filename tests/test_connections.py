@@ -21,7 +21,7 @@ from agent_sherlock.integrations.gmail import (
     GmailProfile,
     GmailStatus,
 )
-from agent_sherlock.integrations.telegram import TelegramStatus
+from agent_sherlock.integrations.telegram import TelegramAPIError, TelegramStatus
 from agent_sherlock.persistence import MessageRepository
 
 
@@ -150,7 +150,7 @@ def test_gmail_fetch_delivers_only_through_pipeline(monkeypatch, capsys):
     assert main(["connections", "gmail", "fetch"]) == 0
 
     output = capsys.readouterr().out
-    assert output == "Sent 1 message to Telegram.\n"
+    assert output == "Sent 1 message to the configured output.\n"
 
 
 def test_gmail_fetch_json_reports_pipeline_counts(monkeypatch, capsys):
@@ -254,7 +254,7 @@ def test_gmail_watch_retries_rate_limit_with_backoff(monkeypatch, capsys):
 def test_gmail_watch_caps_provider_retry_after(monkeypatch, capsys):
     class Pipeline:
         def sync(self, _connector):
-            raise connections_gmail.TelegramAPIError(
+            raise TelegramAPIError(
                 "Flood control.",
                 status=429,
                 retry_after=10_000,
@@ -308,7 +308,7 @@ def test_gmail_watch_dead_letters_permanent_delivery_error_without_exiting(
         name = "telegram"
 
         def send(self, _text):
-            raise connections_gmail.TelegramAPIError(
+            raise TelegramAPIError(
                 "Bad Request: chat not found",
                 status=400,
             )

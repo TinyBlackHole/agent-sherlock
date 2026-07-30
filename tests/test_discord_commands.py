@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from agent_sherlock.application import PipelineError, SyncResult
+from agent_sherlock.application import PendingDeliveryError, PipelineError, SyncResult
 from agent_sherlock.cli import main
 from agent_sherlock.commands import connections, connections_discord
 from agent_sherlock.domain import InboundMessage
@@ -165,8 +165,8 @@ def test_discord_watch_ingests_gateway_message(monkeypatch, capsys):
     assert main(["connections", "discord", "watch"]) == 0
 
     output = capsys.readouterr().out
-    assert "Forwarding Discord #alerts to Telegram" in output
-    assert "Sent 1 queued message to Telegram" in output
+    assert "Forwarding Discord #alerts to telegram" in output
+    assert "Sent 1 queued message to the configured output" in output
     assert "Stopped Discord watch" in output
 
 
@@ -209,6 +209,54 @@ def test_discord_watch_keeps_gateway_alive_after_pipeline_errors(monkeypatch, ca
     output = capsys.readouterr()
     assert output.err.count("Discord watch remains connected") == 2
     assert "Stopped Discord watch" in output.out
+
+
+def test_discord_watch_explains_how_to_resolve_an_output_conflict(
+    monkeypatch,
+    capsys,
+):
+    normalized = inbound_message()
+    conflict = connections_discord.DiscordConfigurationError(
+        "The watched channel is also the output channel."
+    )
+
+    class Connector:
+        credentials = credentials()
+
+        def normalize(self, _message):
+            return normalized
+
+    class Pipeline:
+        def ingest(self, _messages):
+            raise PendingDeliveryError(conflict)
+
+        def deliver_pending(self):
+            raise PendingDeliveryError(conflict)
+
+    def fake_watch(
+        _credentials,
+        handler,
+        *,
+        on_ready_callback,
+        on_maintenance_callback,
+    ):
+        on_ready_callback()
+        handler("gateway-event")
+        on_maintenance_callback()
+
+    monkeypatch.setattr(
+        connections_discord,
+        "_open_pipeline",
+        lambda: (Connector(), Pipeline()),
+    )
+    monkeypatch.setattr(connections_discord, "watch_discord", fake_watch)
+
+    assert main(["connections", "discord", "watch"]) == 0
+
+    output = capsys.readouterr()
+    assert output.err.count("Change the output configuration") == 2
+    assert output.err.count("message remains queued until then") == 2
+    assert "Queued delivery will be retried" not in output.err
 
 
 @pytest.mark.parametrize(

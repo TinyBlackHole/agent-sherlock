@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import sys
+from functools import partial
 from pathlib import Path
 
 from agent_sherlock.application import (
@@ -17,8 +18,14 @@ from agent_sherlock.commands.connections_shared import (
     terminal_safe,
 )
 from agent_sherlock.connectors.discord import DiscordConnector
-from agent_sherlock.destinations.telegram import TelegramDestination
+from agent_sherlock.destinations.active import (
+    DESTINATION_ERRORS,
+    ActiveDestination,
+    active_destination_name,
+)
+from agent_sherlock.destinations.discord import DiscordDestination
 from agent_sherlock.integrations.discord import (
+    DiscordConfigurationError,
     DiscordError,
     DiscordStatus,
     connect_discord,
@@ -26,7 +33,6 @@ from agent_sherlock.integrations.discord import (
     load_discord_credentials,
     watch_discord,
 )
-from agent_sherlock.integrations.telegram import TelegramError
 from agent_sherlock.persistence import MessageRepository, PersistenceError
 
 MAX_TOKEN_FILE_BYTES = 4_096
@@ -59,8 +65,8 @@ def configure(providers: argparse._SubParsersAction) -> None:
 
     watch = actions.add_parser(
         "watch",
-        help="Continuously forward new Discord messages to Telegram.",
-        description="Continuously forward new Discord messages to Telegram.",
+        help="Continuously forward new Discord messages to the output.",
+        description="Continuously forward new Discord messages to the output.",
     )
     watch.set_defaults(connection_handler=run_watch)
 
@@ -168,17 +174,35 @@ def run_connect(args: argparse.Namespace) -> int:
 def _open_pipeline() -> tuple[DiscordConnector, MessagePipeline]:
     credentials = load_discord_credentials()
     connector = DiscordConnector(credentials)
-    pipeline = MessagePipeline(
-        MessageRepository(),
-        TelegramDestination.open(),
+    destination = ActiveDestination.open(
+        validator=partial(_reject_delivery_loop, credentials.channel_id),
     )
+    pipeline = MessagePipeline(MessageRepository(), destination)
     return connector, pipeline
+
+
+def _reject_delivery_loop(watched_channel_id: int, destination: object) -> None:
+    """Refuse to watch the same channel the Discord output posts into.
+
+    Delivered messages would be read back as new input and forwarded again,
+    so the pair has to be rejected before the Gateway connects.
+    """
+    if not isinstance(destination, DiscordDestination):
+        return
+    if destination.credentials.channel_id != watched_channel_id:
+        return
+    raise DiscordConfigurationError(
+        "The watched Discord channel is also the Discord output channel, which "
+        "would forward every delivered message back to itself. Watch a "
+        "different channel or point the output webhook elsewhere."
+    )
 
 
 def run_watch(_args: argparse.Namespace) -> int:
     try:
         connector, pipeline = _open_pipeline()
-    except (DiscordError, TelegramError, PersistenceError) as exc:
+        destination_name = active_destination_name()
+    except (DiscordError, *DESTINATION_ERRORS, PersistenceError) as exc:
         print_error(exc)
         return 1
 
@@ -187,7 +211,7 @@ def run_watch(_args: argparse.Namespace) -> int:
     def on_ready() -> None:
         print(
             f"Forwarding Discord #{terminal_safe(credentials.channel_name)} "
-            "to Telegram. Press Ctrl+C to stop."
+            f"to {destination_name}. Press Ctrl+C to stop."
         )
 
     def on_message(message: object) -> None:
@@ -197,10 +221,7 @@ def run_watch(_args: argparse.Namespace) -> int:
         try:
             result = pipeline.ingest((normalized,))
         except PendingDeliveryError as exc:
-            print(
-                f"Error: {exc} The Discord message remains queued for delivery.",
-                file=sys.stderr,
-            )
+            _print_pending_delivery_error(exc)
             return
         except (PersistenceError, PipelineError) as exc:
             print(
@@ -218,10 +239,7 @@ def run_watch(_args: argparse.Namespace) -> int:
         try:
             result = pipeline.deliver_pending()
         except PendingDeliveryError as exc:
-            print(
-                f"Error: {exc} Queued delivery will be retried.",
-                file=sys.stderr,
-            )
+            _print_pending_delivery_error(exc)
             return
         except (PersistenceError, PipelineError) as exc:
             print(
@@ -242,17 +260,28 @@ def run_watch(_args: argparse.Namespace) -> int:
             on_ready_callback=on_ready,
             on_maintenance_callback=on_maintenance,
         )
-    except (DiscordError, TelegramError, PersistenceError, PipelineError) as exc:
+    except (DiscordError, *DESTINATION_ERRORS, PersistenceError, PipelineError) as exc:
         print_error(exc)
         return 1
     print("Stopped Discord watch.")
     return 0
 
 
+def _print_pending_delivery_error(exception: PendingDeliveryError) -> None:
+    if isinstance(exception.cause, DiscordConfigurationError):
+        guidance = (
+            " Change the output configuration to resolve the conflict; the "
+            "message remains queued until then."
+        )
+    else:
+        guidance = " Queued delivery will be retried."
+    print(f"Error: {exception}{guidance}", file=sys.stderr)
+
+
 def _print_delivery_result(*, delivered: int, dead_lettered: int) -> None:
     if delivered:
         noun = "message" if delivered == 1 else "messages"
-        print(f"Sent {delivered} queued {noun} to Telegram.")
+        print(f"Sent {delivered} queued {noun} to the configured output.")
     if dead_lettered:
         noun = "message" if dead_lettered == 1 else "messages"
         print(
