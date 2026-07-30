@@ -22,6 +22,12 @@ GOOGLE_AUTH_URIS = {
     "https://accounts.google.com/o/oauth2/v2/auth",
 }
 GOOGLE_OAUTH_EXCHANGE_URI = "https://oauth2.googleapis.com/token"
+GMAIL_RETRYABLE_FORBIDDEN_REASONS = frozenset(
+    {
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+    }
+)
 
 
 class GmailError(RuntimeError):
@@ -43,13 +49,28 @@ class GmailAuthenticationError(GmailError):
 class GmailAPIError(GmailError):
     """Raised when Gmail returns an unexpected API failure."""
 
-    def __init__(self, message: str, *, status: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        reasons: frozenset[str] = frozenset(),
+    ):
         super().__init__(message)
         self.status = status
+        self.reasons = reasons
 
     @property
     def retryable(self) -> bool:
-        return self.status is None or self.status in {408, 429} or self.status >= 500
+        return (
+            self.status is None
+            or self.status in {408, 429}
+            or self.status >= 500
+            or (
+                self.status == 403
+                and not self.reasons.isdisjoint(GMAIL_RETRYABLE_FORBIDDEN_REASONS)
+            )
+        )
 
 
 class GmailHistoryExpiredError(GmailAPIError):
@@ -145,6 +166,39 @@ def _status_code(exception: Exception) -> int | None:
     return status if isinstance(status, int) else None
 
 
+def _error_reasons(exception: Exception) -> frozenset[str]:
+    content = getattr(exception, "content", None)
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return frozenset()
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            return frozenset()
+    if not isinstance(content, dict):
+        return frozenset()
+
+    error = content.get("error")
+    if not isinstance(error, dict):
+        return frozenset()
+
+    reasons: set[str] = set()
+    for key in ("errors", "details"):
+        entries = error.get(key, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            reason = entry.get("reason")
+            if isinstance(reason, str) and reason:
+                reasons.add(reason)
+    return frozenset(reasons)
+
+
 def _execute(request: Any, operation: str) -> dict[str, Any]:
     try:
         response = request.execute()
@@ -162,6 +216,7 @@ def _execute(request: Any, operation: str) -> dict[str, Any]:
         raise GmailAPIError(
             f"Unable to {operation}{suffix}.",
             status=status,
+            reasons=_error_reasons(exc),
         ) from exc
 
     if not isinstance(response, dict):

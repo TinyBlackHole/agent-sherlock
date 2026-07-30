@@ -68,9 +68,10 @@ class FakeService:
 
 
 class FakeHTTPError(Exception):
-    def __init__(self, status):
+    def __init__(self, status, content=None):
         super().__init__(f"HTTP {status}")
         self.resp = type("Response", (), {"status": status})()
+        self.content = content
 
 
 def private_paths(tmp_path):
@@ -160,6 +161,54 @@ def test_new_message_ids_are_incremental_paginated_and_deduplicated():
         "maxResults": 500,
     }
     assert calls[1]["pageToken"] == "page-2"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+    ],
+)
+def test_gmail_forbidden_rate_limit_is_retryable(reason):
+    error_body = json.dumps(
+        {
+            "error": {
+                "code": 403,
+                "errors": [{"reason": reason}],
+            }
+        }
+    ).encode()
+
+    with pytest.raises(gmail.GmailAPIError) as exc_info:
+        gmail._execute(
+            FakeRequest(FakeHTTPError(403, error_body)),
+            "read mailbox history",
+        )
+
+    assert exc_info.value.status == 403
+    assert exc_info.value.reasons == frozenset({reason})
+    assert exc_info.value.retryable is True
+
+
+def test_gmail_forbidden_permission_error_is_not_retryable():
+    error_body = json.dumps(
+        {
+            "error": {
+                "code": 403,
+                "errors": [{"reason": "insufficientPermissions"}],
+            }
+        }
+    ).encode()
+
+    with pytest.raises(gmail.GmailAPIError) as exc_info:
+        gmail._execute(
+            FakeRequest(FakeHTTPError(403, error_body)),
+            "read mailbox history",
+        )
+
+    assert exc_info.value.reasons == frozenset({"insufficientPermissions"})
+    assert exc_info.value.retryable is False
 
 
 def test_first_fetch_saves_current_history_as_baseline(tmp_path):

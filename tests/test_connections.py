@@ -46,6 +46,18 @@ def test_gmail_without_action_prints_help(monkeypatch, capsys):
     assert "status" in output
 
 
+def test_gmail_without_action_opens_gmail_menu_in_terminal(monkeypatch):
+    monkeypatch.setattr(connections, "_is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(connections, "run_gmail_menu", lambda: 17)
+
+    def unexpected_root_menu():
+        raise AssertionError("The root connections menu should not open.")
+
+    monkeypatch.setattr(connections, "run_interactive_menu", unexpected_root_menu)
+
+    assert main(["connections", "gmail"]) == 17
+
+
 def test_gmail_connect_requires_credentials_without_terminal(monkeypatch, capsys):
     monkeypatch.setattr(connections, "_is_interactive_terminal", lambda: False)
 
@@ -176,6 +188,30 @@ def test_gmail_watch_does_not_retry_nonretryable_api_error(monkeypatch, capsys):
 
     assert connections.run_gmail_watch(argparse.Namespace(interval=30, json=False)) == 1
     assert "Access denied" in capsys.readouterr().err
+
+
+def test_gmail_watch_retries_rate_limit_with_backoff(monkeypatch, capsys):
+    monkeypatch.setattr(connections, "open_gmail_mailbox", lambda: object())
+
+    def rate_limited(_mailbox):
+        raise connections.GmailAPIError(
+            "Rate limited.",
+            status=403,
+            reasons=frozenset({"userRateLimitExceeded"}),
+        )
+
+    delays = []
+
+    def stop_after_delay(delay):
+        delays.append(delay)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(connections, "fetch_new_gmail_messages", rate_limited)
+    monkeypatch.setattr(connections.time, "sleep", stop_after_delay)
+
+    assert connections.run_gmail_watch(argparse.Namespace(interval=30, json=False)) == 0
+    assert delays == [30]
+    assert "Retrying in 30 seconds" in capsys.readouterr().err
 
 
 def test_interactive_menu_dispatches_gmail_selection(monkeypatch, capsys):

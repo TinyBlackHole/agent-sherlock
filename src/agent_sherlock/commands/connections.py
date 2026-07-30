@@ -113,12 +113,13 @@ def run(args: argparse.Namespace) -> int:
     if handler is not None:
         return handler(args)
 
+    gmail_parser = getattr(args, "gmail_parser", None)
     if _is_interactive_terminal():
+        if gmail_parser is not None:
+            return run_gmail_menu()
         return run_interactive_menu()
 
-    parser = getattr(args, "gmail_parser", None) or getattr(
-        args, "connections_parser", None
-    )
+    parser = gmail_parser or getattr(args, "connections_parser", None)
     if parser is not None:
         parser.print_help()
     return 0
