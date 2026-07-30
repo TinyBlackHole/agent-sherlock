@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 
-from agent_sherlock.commands import connections_gmail, connections_telegram
+from agent_sherlock.commands import (
+    connections_discord,
+    connections_gmail,
+    connections_telegram,
+)
 from agent_sherlock.commands.base import Command
 from agent_sherlock.commands.connections_shared import (
     is_interactive_terminal,
@@ -13,6 +17,7 @@ from agent_sherlock.commands.connections_shared import (
 def configure(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(connections_parser=parser)
     providers = parser.add_subparsers(dest="provider", metavar="<provider>")
+    connections_discord.configure(providers)
     connections_gmail.configure(providers)
     connections_telegram.configure(providers)
 
@@ -48,7 +53,7 @@ def run_interactive_menu() -> int:
     handlers = {
         "1": connections_gmail.run_menu,
         "2": connections_telegram.run_menu,
-        "3": run_discord_menu,
+        "3": connections_discord.run_menu,
     }
     while True:
         choice = read_menu_choice()
@@ -58,21 +63,6 @@ def run_interactive_menu() -> int:
         if handler is not None:
             return handler()
         print("Choose 1, 2, 3, or q.")
-
-
-def run_discord_menu() -> int:
-    print("Agent Sherlock Discord")
-    print("  1. Soon")
-    print("  q. Quit")
-
-    while True:
-        choice = read_menu_choice()
-        if choice in {"q", "quit", "exit"}:
-            return 0
-        if choice == "1":
-            print("Discord integration coming soon.")
-            return 0
-        print("Choose 1 or q.")
 
 
 COMMAND = Command(

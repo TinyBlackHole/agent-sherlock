@@ -154,6 +154,48 @@ of your Google Account. Never commit either the downloaded OAuth JSON or
 Sherlock's token files. Regenerate the Telegram bot token with BotFather if it is
 ever exposed.
 
+## Connect Discord as an input
+
+Sherlock can monitor one Discord server text channel in real time:
+
+1. Create an application in the
+   [Discord Developer Portal](https://discord.com/developers/applications) and
+   add a bot.
+2. On the bot settings page, enable **Message Content Intent**.
+3. Install the bot in the server with permission to view the selected channel.
+4. In Discord, enable Developer Mode and copy the channel ID.
+5. Put the bot token in a private temporary file and connect it:
+
+```bash
+sherlock connections discord connect \
+  --token-file /path/to/private-token \
+  --channel-id 123456789012345678
+```
+
+The token is requested with hidden terminal input when `--token-file` is
+omitted from an interactive terminal. Sherlock validates the bot and channel
+before saving the connection. Check its local status with:
+
+```bash
+sherlock connections discord status
+```
+
+Start the foreground Gateway connection:
+
+```bash
+sherlock connections discord watch
+```
+
+Only messages created while `watch` is connected are received; existing channel
+history is not replayed. Text, attachment links, stickers, and basic embed
+content are normalized into the durable inbox before delivery to Telegram.
+Provider message IDs make replay after a Gateway reconnect idempotent.
+
+The bot token is stored under
+`~/.config/agent-sherlock/connections/discord/` with the same private-file
+protections as the other connections. Never commit the token, and reset it in
+the Developer Portal if it is exposed.
+
 ## Architecture
 
 Every input connector converts its provider event into a common
@@ -162,7 +204,7 @@ acknowledging the provider checkpoint. A processor prepares the output, and the
 single Telegram destination delivers it.
 
 ```text
-Gmail / future inputs
+Gmail / Discord / future inputs
         |
         v
 InboundMessage -> SQLite inbox -> processor -> private Telegram chat

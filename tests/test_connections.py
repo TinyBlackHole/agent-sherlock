@@ -9,11 +9,13 @@ from agent_sherlock.application import MessagePipeline, SyncResult
 from agent_sherlock.cli import main
 from agent_sherlock.commands import (
     connections,
+    connections_discord,
     connections_gmail,
     connections_telegram,
 )
 from agent_sherlock.connectors import ConnectorBatch
 from agent_sherlock.domain import InboundMessage
+from agent_sherlock.integrations.discord import DiscordStatus
 from agent_sherlock.integrations.gmail import (
     GmailAuthenticationError,
     GmailProfile,
@@ -40,6 +42,7 @@ def test_connections_without_provider_prints_help(monkeypatch, capsys):
     assert "usage: sherlock connections" in output
     assert "gmail" in output
     assert "telegram" in output
+    assert "discord" in output
 
 
 def test_gmail_without_action_prints_help(monkeypatch, capsys):
@@ -376,16 +379,27 @@ def test_interactive_menu_dispatches_gmail_selection(monkeypatch, capsys):
     assert "Gmail is connected: person@example.com" in output
 
 
-def test_interactive_menu_opens_discord_placeholder(monkeypatch, capsys):
-    choices = iter(["3", "1"])
+def test_interactive_menu_opens_discord_menu(monkeypatch, capsys):
+    choices = iter(["3", "3"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(choices))
+    monkeypatch.setattr(
+        connections_discord,
+        "discord_status",
+        lambda: DiscordStatus(
+            connected=True,
+            bot_username="sherlock_bot",
+            guild_id=8,
+            channel_id=9,
+            channel_name="alerts",
+        ),
+    )
 
     assert connections.run_interactive_menu() == 0
 
     output = capsys.readouterr().out
     assert "Agent Sherlock Discord" in output
-    assert "1. Soon" in output
-    assert "Discord integration coming soon." in output
+    assert "1. Connect Discord" in output
+    assert "@sherlock_bot watching #alerts (9)" in output
 
 
 def test_telegram_connect_reads_token_file(monkeypatch, tmp_path, capsys):
