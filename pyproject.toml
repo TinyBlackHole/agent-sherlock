@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-sherlock"
 dynamic = ["version"]
-description = "Agent Sherlock command-line application."
+description = "Secure service connections and event fetching from the terminal."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -25,6 +25,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "bandit>=1.9",
+  "pip-audit>=2.10",
   "pytest>=8",
   "ruff>=0.6",
 ]

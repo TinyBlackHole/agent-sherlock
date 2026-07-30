@@ -1,45 +1,18 @@
 import argparse
 import json
+from pathlib import Path
 
 import pytest
 
 from agent_sherlock.cli import main
 from agent_sherlock.commands import connections
-
-
-class FakeListRequest:
-    def __init__(self, response):
-        self.response = response
-
-    def execute(self):
-        return self.response
-
-
-class FakeMessages:
-    def __init__(self, pages):
-        self.pages = pages
-        self.calls = 0
-
-    def list(self, **_kwargs):
-        response = self.pages[self.calls]
-        self.calls += 1
-        return FakeListRequest(response)
-
-
-class FakeUsers:
-    def __init__(self, pages):
-        self._messages = FakeMessages(pages)
-
-    def messages(self):
-        return self._messages
-
-
-class FakeGmailService:
-    def __init__(self, pages):
-        self._users = FakeUsers(pages)
-
-    def users(self):
-        return self._users
+from agent_sherlock.integrations.gmail import (
+    GmailAuthenticationError,
+    GmailFetchResult,
+    GmailMessage,
+    GmailProfile,
+    GmailStatus,
+)
 
 
 def test_connections_command_appears_in_help(capsys):
@@ -50,7 +23,9 @@ def test_connections_command_appears_in_help(capsys):
     assert "connections" in capsys.readouterr().out
 
 
-def test_connections_without_provider_prints_help(capsys):
+def test_connections_without_provider_prints_help(monkeypatch, capsys):
+    monkeypatch.setattr(connections, "_is_interactive_terminal", lambda: False)
+
     assert main(["connections"]) == 0
 
     output = capsys.readouterr().out
@@ -58,16 +33,39 @@ def test_connections_without_provider_prints_help(capsys):
     assert "gmail" in output
 
 
-def test_gmail_without_action_prints_help(capsys):
+def test_gmail_without_action_prints_help(monkeypatch, capsys):
+    monkeypatch.setattr(connections, "_is_interactive_terminal", lambda: False)
+
     assert main(["connections", "gmail"]) == 0
 
     output = capsys.readouterr().out
     assert "usage: sherlock connections gmail" in output
     assert "connect" in output
+    assert "fetch" in output
     assert "watch" in output
+    assert "status" in output
 
 
-def test_gmail_connect_missing_credentials_returns_nonzero(capsys):
+def test_gmail_connect_requires_credentials_without_terminal(monkeypatch, capsys):
+    monkeypatch.setattr(connections, "_is_interactive_terminal", lambda: False)
+
+    assert main(["connections", "gmail", "connect"]) == 2
+
+    assert "provide --credentials" in capsys.readouterr().err
+
+
+def test_gmail_connect_prints_connected_account(monkeypatch, capsys):
+    seen = []
+
+    def fake_connect(path):
+        seen.append(path)
+        return GmailProfile(
+            email_address="person@example.com",
+            history_id="123",
+        )
+
+    monkeypatch.setattr(connections, "connect_gmail", fake_connect)
+
     assert (
         main(
             [
@@ -75,76 +73,136 @@ def test_gmail_connect_missing_credentials_returns_nonzero(capsys):
                 "gmail",
                 "connect",
                 "--credentials",
-                "/does/not/exist.json",
+                "/tmp/client.json",
             ]
         )
-        == 2
+        == 0
     )
 
-    assert "Gmail credentials file not found" in capsys.readouterr().out
+    assert seen == [Path("/tmp/client.json")]
+    output = capsys.readouterr().out
+    assert "Gmail connected: person@example.com" in output
+    assert "bodies remain inaccessible" in output
 
 
-def test_config_dir_uses_env_override(monkeypatch, tmp_path):
-    monkeypatch.setenv("SHERLOCK_CONFIG_DIR", str(tmp_path))
+def test_gmail_fetch_missing_connection_returns_nonzero(monkeypatch, capsys):
+    def fail_to_open():
+        raise GmailAuthenticationError("Gmail is not connected.")
 
-    assert (
-        connections.gmail_state_path()
-        == tmp_path / "connections" / "gmail" / "state.json"
+    monkeypatch.setattr(connections, "open_gmail_mailbox", fail_to_open)
+
+    assert main(["connections", "gmail", "fetch"]) == 1
+    assert "Gmail is not connected" in capsys.readouterr().err
+
+
+def test_fetch_output_strips_terminal_control_characters(monkeypatch, capsys):
+    message = GmailMessage(
+        message_id="m1",
+        thread_id="t1",
+        sender="\N{ESCAPE}[31mAttacker\N{ESCAPE}[0m",
+        subject="Hello\nInjected line",
+        date="Today",
+        internal_date=1,
+    )
+    monkeypatch.setattr(connections, "open_gmail_mailbox", lambda: object())
+    monkeypatch.setattr(
+        connections,
+        "fetch_new_gmail_messages",
+        lambda _mailbox: GmailFetchResult(messages=(message,)),
     )
 
+    assert main(["connections", "gmail", "fetch"]) == 0
 
-def test_watch_once_saves_baseline_without_touch(monkeypatch, tmp_path, capsys):
-    touched = []
-    monkeypatch.setattr(connections, "touch_hello", lambda: touched.append(True))
-    service = FakeGmailService([{"messages": [{"id": "old-1"}, {"id": "old-2"}]}])
-
-    assert connections.gmail_watch_once(service, tmp_path / "state.json") == 0
-
-    assert touched == []
-    assert json.loads((tmp_path / "state.json").read_text()) == {
-        "seen_message_ids": ["old-1", "old-2"]
-    }
-    assert "baseline saved" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "\N{ESCAPE}" not in output
+    assert "Subject: Hello Injected line" in output
+    assert output.count("New Gmail message") == 1
 
 
-def test_watch_once_touches_once_per_new_message(monkeypatch, tmp_path):
-    state = tmp_path / "state.json"
-    state.write_text(json.dumps({"seen_message_ids": ["old-1"]}))
-    touched = []
-    monkeypatch.setattr(connections, "touch_hello", lambda: touched.append(True))
-    service = FakeGmailService(
-        [{"messages": [{"id": "old-1"}, {"id": "new-1"}, {"id": "new-2"}]}]
+def test_fetch_json_escapes_untrusted_control_characters(monkeypatch, capsys):
+    message = GmailMessage(
+        message_id="m1",
+        thread_id="t1",
+        sender="\N{ESCAPE}]0;malicious",
+        subject="Subject",
+        date="Today",
+        internal_date=1,
+    )
+    monkeypatch.setattr(connections, "open_gmail_mailbox", lambda: object())
+    monkeypatch.setattr(
+        connections,
+        "fetch_new_gmail_messages",
+        lambda _mailbox: GmailFetchResult(messages=(message,)),
     )
 
-    assert connections.gmail_watch_once(service, state) == 2
+    assert main(["connections", "gmail", "fetch", "--json"]) == 0
 
-    assert touched == [True, True]
-    assert json.loads(state.read_text()) == {
-        "seen_message_ids": ["new-1", "new-2", "old-1"]
-    }
-
-
-def test_watch_once_reads_paginated_inbox(tmp_path):
-    service = FakeGmailService(
-        [
-            {"messages": [{"id": "one"}], "nextPageToken": "page-2"},
-            {"messages": [{"id": "two"}]},
-        ]
-    )
-
-    assert connections.gmail_watch_once(service, tmp_path / "state.json") == 0
-    assert json.loads((tmp_path / "state.json").read_text()) == {
-        "seen_message_ids": ["one", "two"]
-    }
-
-
-def test_gmail_watch_missing_connection_returns_nonzero(monkeypatch, tmp_path, capsys):
-    monkeypatch.setenv("SHERLOCK_CONFIG_DIR", str(tmp_path))
-
-    assert connections.run_gmail_watch(argparse.Namespace(interval=30)) == 2
-    assert "Gmail is not connected" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "\N{ESCAPE}" not in output
+    parsed = json.loads(output)
+    assert parsed["count"] == 1
+    assert parsed["messages"][0]["from"].startswith("\N{ESCAPE}")
 
 
 def test_gmail_watch_rejects_nonpositive_interval(capsys):
-    assert connections.run_gmail_watch(argparse.Namespace(interval=0)) == 2
-    assert "--interval must be greater than 0" in capsys.readouterr().out
+    assert connections.run_gmail_watch(argparse.Namespace(interval=0, json=False)) == 2
+    assert "--interval must be greater than 0" in capsys.readouterr().err
+
+
+def test_gmail_watch_stops_cleanly(monkeypatch, capsys):
+    monkeypatch.setattr(connections, "open_gmail_mailbox", lambda: object())
+    monkeypatch.setattr(
+        connections,
+        "fetch_new_gmail_messages",
+        lambda _mailbox: GmailFetchResult(),
+    )
+
+    def stop(_delay):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(connections.time, "sleep", stop)
+
+    assert connections.run_gmail_watch(argparse.Namespace(interval=30, json=False)) == 0
+    assert "Stopped Gmail watch" in capsys.readouterr().out
+
+
+def test_gmail_watch_does_not_retry_nonretryable_api_error(monkeypatch, capsys):
+    monkeypatch.setattr(connections, "open_gmail_mailbox", lambda: object())
+
+    def forbidden(_mailbox):
+        raise connections.GmailAPIError("Access denied.", status=403)
+
+    monkeypatch.setattr(connections, "fetch_new_gmail_messages", forbidden)
+
+    assert connections.run_gmail_watch(argparse.Namespace(interval=30, json=False)) == 1
+    assert "Access denied" in capsys.readouterr().err
+
+
+def test_interactive_menu_dispatches_gmail_selection(monkeypatch, capsys):
+    choices = iter(["1", "4"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(choices))
+    monkeypatch.setattr(
+        connections,
+        "gmail_status",
+        lambda: GmailStatus(connected=True, email_address="person@example.com"),
+    )
+
+    assert connections.run_interactive_menu() == 0
+
+    output = capsys.readouterr().out
+    assert "1. Gmail" in output
+    assert "2. Discord" in output
+    assert "Agent Sherlock Gmail" in output
+    assert "Gmail is connected: person@example.com" in output
+
+
+def test_interactive_menu_opens_discord_placeholder(monkeypatch, capsys):
+    choices = iter(["2", "1"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(choices))
+
+    assert connections.run_interactive_menu() == 0
+
+    output = capsys.readouterr().out
+    assert "Agent Sherlock Discord" in output
+    assert "1. Soon" in output
+    assert "Discord integration coming soon." in output
