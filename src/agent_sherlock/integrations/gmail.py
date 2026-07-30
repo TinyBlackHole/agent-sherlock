@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from base64 import urlsafe_b64decode
 from dataclasses import dataclass
 from email.header import decode_header, make_header
+from email.message import Message
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +16,10 @@ from agent_sherlock.storage import (
     read_json_object,
 )
 
-GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.metadata",)
-GMAIL_METADATA_HEADERS = ("Date", "From", "Subject")
+GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 STATE_SCHEMA_VERSION = 1
 MAX_CLIENT_SECRETS_BYTES = 1_000_000
+MAX_MESSAGE_BODY_CHARACTERS = 100_000
 GOOGLE_AUTH_URIS = {
     "https://accounts.google.com/o/oauth2/auth",
     "https://accounts.google.com/o/oauth2/v2/auth",
@@ -126,16 +129,7 @@ class GmailMessage:
     subject: str
     date: str
     internal_date: int
-
-    def as_json(self) -> dict[str, Any]:
-        return {
-            "date": self.date,
-            "from": self.sender,
-            "id": self.message_id,
-            "internal_date": self.internal_date,
-            "subject": self.subject,
-            "thread_id": self.thread_id,
-        }
+    body: str = ""
 
 
 @dataclass(frozen=True)
@@ -143,6 +137,13 @@ class GmailFetchResult:
     messages: tuple[GmailMessage, ...] = ()
     initialized: bool = False
     history_reset: bool = False
+
+
+@dataclass(frozen=True)
+class GmailFetchPlan:
+    result: GmailFetchResult
+    next_state: GmailState
+    paths: GmailPaths
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,126 @@ def _decode_email_header(value: Any) -> str:
         return str(make_header(decode_header(value)))
     except (LookupError, UnicodeError):
         return value
+
+
+class _HTMLTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_depth = 0
+        self._text: list[str] = []
+
+    def handle_starttag(
+        self,
+        tag: str,
+        _attributes: list[tuple[str, str | None]],
+    ) -> None:
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+        elif self._ignored_depth == 0 and tag in {
+            "br",
+            "div",
+            "li",
+            "p",
+            "table",
+            "tr",
+        }:
+            self._text.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+        elif self._ignored_depth == 0 and tag in {"div", "li", "p", "table", "tr"}:
+            self._text.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth == 0:
+            self._text.append(data)
+
+    def text(self) -> str:
+        lines = (" ".join(line.split()) for line in "".join(self._text).splitlines())
+        return "\n".join(line for line in lines if line)
+
+
+def _part_header(part: dict[str, Any], name: str) -> str:
+    headers = part.get("headers", [])
+    if not isinstance(headers, list):
+        return ""
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        header_name = header.get("name")
+        value = header.get("value")
+        if (
+            isinstance(header_name, str)
+            and header_name.casefold() == name.casefold()
+            and isinstance(value, str)
+        ):
+            return value
+    return ""
+
+
+def _decode_part_text(part: dict[str, Any]) -> str:
+    body = part.get("body", {})
+    if not isinstance(body, dict):
+        return ""
+    encoded = body.get("data")
+    if not isinstance(encoded, str) or not encoded:
+        return ""
+
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = urlsafe_b64decode(f"{encoded}{padding}")
+    except (ValueError, TypeError):
+        return ""
+
+    content_type = _part_header(part, "Content-Type")
+    message = Message()
+    if content_type:
+        message["content-type"] = content_type
+    charset = message.get_content_charset() or "utf-8"
+    try:
+        return raw.decode(charset, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def _message_body(payload: dict[str, Any]) -> str:
+    plain_text: list[str] = []
+    html_text: list[str] = []
+
+    def collect(part: dict[str, Any]) -> None:
+        mime_type = part.get("mimeType")
+        filename = part.get("filename")
+        if isinstance(filename, str) and filename:
+            return
+        if mime_type == "text/plain":
+            text = _decode_part_text(part)
+            if text:
+                plain_text.append(text)
+        elif mime_type == "text/html":
+            text = _decode_part_text(part)
+            if text:
+                html_text.append(text)
+
+        parts = part.get("parts", [])
+        if isinstance(parts, list):
+            for child in parts:
+                if isinstance(child, dict):
+                    collect(child)
+
+    collect(payload)
+    text = "\n".join(plain_text).strip()
+    if not text and html_text:
+        extractor = _HTMLTextExtractor()
+        try:
+            extractor.feed("\n".join(html_text))
+            extractor.close()
+            text = extractor.text().strip()
+        except (UnicodeError, ValueError):
+            text = ""
+    if len(text) > MAX_MESSAGE_BODY_CHARACTERS:
+        return f"{text[: MAX_MESSAGE_BODY_CHARACTERS - 1]}…"
+    return text
 
 
 def _status_code(exception: Exception) -> int | None:
@@ -208,7 +329,7 @@ def _execute(request: Any, operation: str) -> dict[str, Any]:
             raise GmailHistoryExpiredError(
                 "Gmail's incremental history expired; a new baseline is required."
             ) from exc
-        if operation == "fetch message metadata" and status == 404:
+        if operation in {"fetch message", "fetch message metadata"} and status == 404:
             raise GmailMessageUnavailableError(
                 "A Gmail message was removed before it could be fetched."
             ) from exc
@@ -306,17 +427,16 @@ class GmailMailbox:
             seen_page_tokens.add(page_token)
             next_page_token = page_token
 
-    def message_metadata(self, message_id: str) -> GmailMessage:
+    def message(self, message_id: str) -> GmailMessage:
         response = _execute(
             self._service.users()
             .messages()
             .get(
                 userId="me",
                 id=message_id,
-                format="metadata",
-                metadataHeaders=list(GMAIL_METADATA_HEADERS),
+                format="full",
             ),
-            "fetch message metadata",
+            "fetch message",
         )
         payload = response.get("payload", {})
         headers = payload.get("headers", []) if isinstance(payload, dict) else []
@@ -344,6 +464,7 @@ class GmailMailbox:
             subject=headers_by_name.get("subject", ""),
             date=headers_by_name.get("date", ""),
             internal_date=internal_date,
+            body=_message_body(payload) if isinstance(payload, dict) else "",
         )
 
 
@@ -585,48 +706,64 @@ def fetch_new_gmail_messages(
     *,
     paths: GmailPaths | None = None,
 ) -> GmailFetchResult:
+    plan = prepare_gmail_fetch(mailbox, paths=paths)
+    commit_gmail_fetch(plan)
+    return plan.result
+
+
+def prepare_gmail_fetch(
+    mailbox: GmailMailbox,
+    *,
+    paths: GmailPaths | None = None,
+) -> GmailFetchPlan:
+    """Read an incremental batch without advancing the durable checkpoint."""
     selected_paths = paths or GmailPaths.default()
     state = _load_state(selected_paths)
     if state is None:
         profile = mailbox.profile()
-        _save_state(
-            selected_paths,
-            GmailState(
+        return GmailFetchPlan(
+            result=GmailFetchResult(initialized=True),
+            next_state=GmailState(
                 history_id=profile.history_id,
                 email_address=profile.email_address,
             ),
+            paths=selected_paths,
         )
-        return GmailFetchResult(initialized=True)
 
     try:
         message_ids, latest_history_id = mailbox.new_message_ids(state.history_id)
     except GmailHistoryExpiredError:
         profile = mailbox.profile()
-        _save_state(
-            selected_paths,
-            GmailState(
+        return GmailFetchPlan(
+            result=GmailFetchResult(history_reset=True),
+            next_state=GmailState(
                 history_id=profile.history_id,
                 email_address=profile.email_address,
             ),
+            paths=selected_paths,
         )
-        return GmailFetchResult(history_reset=True)
 
     messages: list[GmailMessage] = []
     for message_id in message_ids:
         try:
-            messages.append(mailbox.message_metadata(message_id))
+            messages.append(mailbox.message(message_id))
         except GmailMessageUnavailableError:
             continue
 
-    _save_state(
-        selected_paths,
-        GmailState(
+    messages.sort(key=lambda message: (message.internal_date, message.message_id))
+    return GmailFetchPlan(
+        result=GmailFetchResult(messages=tuple(messages)),
+        next_state=GmailState(
             history_id=latest_history_id,
             email_address=state.email_address,
         ),
+        paths=selected_paths,
     )
-    messages.sort(key=lambda message: (message.internal_date, message.message_id))
-    return GmailFetchResult(messages=tuple(messages))
+
+
+def commit_gmail_fetch(plan: GmailFetchPlan) -> None:
+    """Advance Gmail only after the caller has durably handled every message."""
+    _save_state(plan.paths, plan.next_state)
 
 
 def gmail_status(*, paths: GmailPaths | None = None) -> GmailStatus:

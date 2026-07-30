@@ -1,7 +1,7 @@
 # Agent Sherlock
 
-A small command-line application for securely connecting services and reacting
-to new events.
+A local message hub that securely reads incoming events from connected services
+and delivers them to one private Telegram chat.
 
 Source: https://github.com/TinyBlackHole/agent-sherlock
 
@@ -41,7 +41,34 @@ sherlock
 
 Subcommands are invoked as `sherlock <command> [options]`.
 
-## Connect Gmail
+## Connect Telegram
+
+Telegram is Sherlock's only output. Create a bot with
+[@BotFather](https://t.me/BotFather), then run:
+
+```bash
+sherlock connections telegram connect
+```
+
+The token is requested with hidden terminal input. Sherlock validates the bot
+and prints a one-time Telegram link. Open the link and press **Start** to
+authorize that private chat.
+
+For non-interactive setup, place the token in a private temporary file:
+
+```bash
+sherlock connections telegram connect --token-file /path/to/private-token
+```
+
+The one-time link remains required unless an existing private chat is selected
+with `--chat-id`. Check the connection or send a test:
+
+```bash
+sherlock connections telegram status
+sherlock connections telegram test
+```
+
+## Connect Gmail as an input
 
 Before the first connection:
 
@@ -66,12 +93,19 @@ authorization in the browser. You can also run the direct command:
 sherlock connections gmail connect --credentials /path/to/credentials.json
 ```
 
-Sherlock requests only the `gmail.metadata` scope. It can read message headers
-and labels to report the sender, subject, and date, but it cannot read email
-bodies, modify mail, or send mail. The downloaded OAuth client file is read
-during connection and is not copied into Sherlock's configuration.
+Sherlock requests only `gmail.readonly`. It can read incoming email content but
+cannot modify or send mail. The downloaded OAuth client file is read during
+connection and is not copied into Sherlock's configuration.
 
-Check once for mail received since the previous check:
+Versions that previously used `gmail.metadata` must reconnect once so Gmail can
+grant the new read-only scope.
+
+The full body of each newly discovered email is stored locally as plaintext in
+SQLite until and after delivery. Sherlock protects that database with private
+filesystem permissions, but does not application-encrypt its contents.
+
+Check once for mail received since the previous check and deliver it to
+Telegram:
 
 ```bash
 sherlock connections gmail fetch
@@ -83,10 +117,11 @@ Or watch continuously in the foreground:
 sherlock connections gmail watch
 ```
 
-The connection command records the current mailbox history as a baseline, so
-existing messages are not replayed as new. The default watch interval is 30
-seconds. Use `--interval SECONDS` to change it or `--json` on `fetch`/`watch` for
-machine-readable output.
+The Gmail connection records the current mailbox history as a baseline, so
+existing messages are not replayed. The default watch interval is 30 seconds.
+Use `--interval SECONDS` to change it or `--json` on `fetch`/`watch` for an
+operational result containing counts only. Email content is delivered only to
+Telegram, never printed by these commands.
 
 Check local connection status:
 
@@ -94,15 +129,48 @@ Check local connection status:
 sherlock connections gmail status
 ```
 
+The status includes the number of messages in durable dead-letter storage so
+permanent delivery failures remain visible.
+
 OAuth refresh tokens and synchronization state are stored under
-`~/.config/agent-sherlock/connections/gmail/`. On POSIX systems, Sherlock
-enforces `0700` on that directory and `0600` on its files, and all updates are
-atomic. Set `SHERLOCK_CONFIG_DIR` to override the configuration root; otherwise
-`XDG_CONFIG_HOME` is honored when present.
+`~/.config/agent-sherlock/connections/`. The durable message inbox and delivery
+state live in `~/.config/agent-sherlock/sherlock.db`. On POSIX systems, Sherlock
+creates its managed directories with `0700`, enforces `0600` on private files,
+and writes configuration atomically. An existing custom configuration root
+keeps its original mode; private directories below it are still hardened. Set
+`SHERLOCK_CONFIG_DIR` to override the configuration root; otherwise
+`XDG_CONFIG_HOME` is honored.
+
+Messages are inserted into SQLite before Gmail's history checkpoint advances.
+Retryable or unclassified Telegram failures therefore remain pending without
+losing the incoming email. A repeatedly failing error that Telegram explicitly
+classifies as non-retryable is moved to durable dead-letter storage after three
+attempts so it cannot block later messages. `watch` applies backoff while those
+delivery attempts are pending. Provider event IDs prevent the same email from
+being inserted twice.
 
 To revoke access, remove Agent Sherlock from the third-party connections page
 of your Google Account. Never commit either the downloaded OAuth JSON or
-Sherlock's token file.
+Sherlock's token files. Regenerate the Telegram bot token with BotFather if it is
+ever exposed.
+
+## Architecture
+
+Every input connector converts its provider event into a common
+`InboundMessage`. The pipeline persists and deduplicates that message before
+acknowledging the provider checkpoint. A processor prepares the output, and the
+single Telegram destination delivers it.
+
+```text
+Gmail / future inputs
+        |
+        v
+InboundMessage -> SQLite inbox -> processor -> private Telegram chat
+```
+
+The current processor forwards a safe plain-text representation. An AI provider
+can be inserted at that boundary later without coupling it to Gmail, Discord, or
+Telegram.
 
 ## Adding a command
 

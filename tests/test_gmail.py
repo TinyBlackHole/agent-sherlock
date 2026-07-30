@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+from base64 import urlsafe_b64encode
 
 import pytest
 
@@ -92,17 +93,22 @@ def message_response(
     subject="Hello",
     date="Thu, 30 Jul 2026 10:00:00 +0000",
     internal_date="1",
+    body="",
 ):
+    encoded_body = urlsafe_b64encode(body.encode()).decode().rstrip("=")
     return {
         "id": message_id,
         "threadId": f"thread-{message_id}",
         "internalDate": internal_date,
         "payload": {
+            "mimeType": "text/plain",
             "headers": [
                 {"name": "From", "value": sender},
                 {"name": "Subject", "value": subject},
                 {"name": "Date", "value": date},
-            ]
+                {"name": "Content-Type", "value": "text/plain; charset=utf-8"},
+            ],
+            "body": {"data": encoded_body},
         },
     }
 
@@ -254,6 +260,7 @@ def test_fetch_returns_metadata_and_advances_history_after_success(tmp_path):
                 "older",
                 subject="=?utf-8?q?Ol=C3=A1?=",
                 internal_date="10",
+                body="Message body",
             ),
         },
     )
@@ -263,10 +270,34 @@ def test_fetch_returns_metadata_and_advances_history_after_success(tmp_path):
 
     assert [message.message_id for message in result.messages] == ["older", "newer"]
     assert result.messages[0].subject == "Olá"
+    assert result.messages[0].body == "Message body"
     assert json.loads(paths.state.read_text())["history_id"] == "120"
     for call in service.users_resource.messages_resource.calls:
-        assert call["format"] == "metadata"
-        assert call["metadataHeaders"] == ["Date", "From", "Subject"]
+        assert call["format"] == "full"
+        assert "metadataHeaders" not in call
+
+
+def test_html_body_extraction_preserves_structure_and_ignores_active_content():
+    html = """
+    <div>Hello<br>world</div>
+    <script>stealCredentials()</script>
+    <style>.hidden { display: none; }</style>
+    <p>Visible &amp; safe</p>
+    """
+    encoded = urlsafe_b64encode(html.encode()).decode().rstrip("=")
+    payload = {
+        "mimeType": "text/html",
+        "headers": [
+            {"name": "Content-Type", "value": "text/html; charset=utf-8"},
+        ],
+        "body": {"data": encoded},
+    }
+
+    body = gmail._message_body(payload)
+
+    assert body == "Hello\nworld\nVisible & safe"
+    assert "stealCredentials" not in body
+    assert "display" not in body
 
 
 def test_fetch_does_not_advance_state_if_message_fetch_fails(tmp_path):
@@ -449,11 +480,11 @@ def test_failed_authorization_preserves_existing_connection(monkeypatch, tmp_pat
     assert json.loads(paths.token.read_text()) == {"old": "token"}
 
 
-def test_status_rejects_token_with_broader_legacy_scope(tmp_path):
+def test_status_rejects_token_with_old_metadata_scope(tmp_path):
     paths = private_paths(tmp_path)
     gmail.atomic_write_json(
         paths.token,
-        {"scopes": ["https://www.googleapis.com/auth/gmail.readonly"]},
+        {"scopes": ["https://www.googleapis.com/auth/gmail.metadata"]},
     )
 
     with pytest.raises(gmail.GmailAuthenticationError, match="outdated permissions"):

@@ -32,6 +32,40 @@ def test_atomic_write_json_is_private_and_valid(tmp_path):
         assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
 
 
+def test_atomic_write_preserves_existing_config_root_and_hardens_children(
+    monkeypatch,
+    tmp_path,
+):
+    config = tmp_path / "config"
+    config.mkdir(mode=0o755)
+    config.chmod(0o755)
+    monkeypatch.setenv("SHERLOCK_CONFIG_DIR", str(config))
+    target = config / "connections" / "gmail" / "state.json"
+
+    storage.atomic_write_json(target, {"history_id": "1"})
+
+    if os.name == "posix":
+        assert stat.S_IMODE(config.stat().st_mode) == 0o755
+        assert stat.S_IMODE((config / "connections").stat().st_mode) == 0o700
+        assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+
+
+def test_config_root_allows_a_symlink_boundary(monkeypatch, tmp_path):
+    actual_root = tmp_path / "dotfiles" / "sherlock"
+    actual_root.mkdir(parents=True)
+    linked_root = tmp_path / "configured-sherlock"
+    linked_root.symlink_to(actual_root, target_is_directory=True)
+    monkeypatch.setenv("SHERLOCK_CONFIG_DIR", str(linked_root))
+
+    target = storage.config_root() / "connections" / "gmail" / "state.json"
+    storage.atomic_write_json(target, {"history_id": "1"})
+
+    assert storage.config_root() == actual_root.resolve()
+    assert json.loads(
+        (actual_root / "connections" / "gmail" / "state.json").read_text()
+    ) == {"history_id": "1"}
+
+
 def test_atomic_write_replaces_existing_file(tmp_path):
     target = tmp_path / "private" / "state.json"
     storage.atomic_write_json(target, {"version": 1})
@@ -60,6 +94,26 @@ def test_read_private_json_refuses_symbolic_link(tmp_path):
 
     with pytest.raises(storage.StorageError, match="symbolic link"):
         storage.read_json_object(link, private=True)
+
+
+def test_atomic_write_refuses_symbolic_link_in_private_directory_tree(
+    monkeypatch,
+    tmp_path,
+):
+    config = tmp_path / "config"
+    outside = tmp_path / "outside"
+    config.mkdir()
+    outside.mkdir()
+    (config / "connections").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("SHERLOCK_CONFIG_DIR", str(config))
+
+    with pytest.raises(storage.StorageError, match="symbolic link"):
+        storage.atomic_write_json(
+            config / "connections" / "gmail" / "state.json",
+            {"history_id": "1"},
+        )
+
+    assert not (outside / "gmail" / "state.json").exists()
 
 
 def test_read_json_rejects_non_object(tmp_path):

@@ -19,27 +19,66 @@ def config_root() -> Path:
     """Return the platform-appropriate Sherlock configuration directory."""
     override = os.environ.get("SHERLOCK_CONFIG_DIR")
     if override:
-        return Path(override).expanduser()
+        root = Path(override).expanduser()
+    else:
+        xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+        if xdg_config_home:
+            root = Path(xdg_config_home).expanduser() / "agent-sherlock"
+        else:
+            root = Path.home() / ".config" / "agent-sherlock"
 
-    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
-    if xdg_config_home:
-        return Path(xdg_config_home).expanduser() / "agent-sherlock"
-
-    return Path.home() / ".config" / "agent-sherlock"
+    # Resolving only the configured boundary permits legitimate dotfile-managed
+    # roots while symlinks created inside that boundary remain detectable.
+    return root.resolve(strict=False)
 
 
-def ensure_private_directory(path: Path) -> None:
+def ensure_private_directory(
+    path: Path,
+    *,
+    preserve_existing_mode: bool = False,
+) -> None:
+    path = path.expanduser().absolute()
+    if path == path.parent:
+        raise StorageError(
+            f"Refusing to use a filesystem root as private configuration: {path}"
+        )
+
+    path_existed = path.exists()
+    missing_directories: list[Path] = []
+    current = path
+    while not current.exists() and current != current.parent:
+        missing_directories.append(current)
+        current = current.parent
+
     try:
         path.mkdir(mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+        directories_to_check = [*missing_directories, path]
+        for directory in directories_to_check:
+            directory_stat = directory.lstat()
+            if stat.S_ISLNK(directory_stat.st_mode):
+                raise StorageError(
+                    f"Refusing to use a symbolic link as a private directory: "
+                    f"{directory}"
+                )
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise StorageError(
+                    f"Configuration path is not a directory: {directory}"
+                )
         if os.name == "posix":
-            path.chmod(PRIVATE_DIRECTORY_MODE)
+            directories_to_harden = missing_directories
+            if not (preserve_existing_mode and path_existed):
+                directories_to_harden = [*directories_to_harden, path]
+            for directory in dict.fromkeys(directories_to_harden):
+                directory.chmod(PRIVATE_DIRECTORY_MODE)
+    except StorageError:
+        raise
     except OSError as exc:
         raise StorageError(
             f"Cannot create private configuration directory: {path}"
         ) from exc
 
 
-def _harden_private_file(path: Path) -> None:
+def harden_private_file(path: Path) -> None:
     try:
         file_stat = path.lstat()
     except OSError as exc:
@@ -69,7 +108,7 @@ def read_json_object(
         raise StorageError(f"Configuration file not found: {path}")
 
     if private:
-        _harden_private_file(path)
+        harden_private_file(path)
 
     try:
         with path.open(encoding="utf-8") as file:
@@ -89,7 +128,22 @@ def atomic_write_text(
     mode: int = PRIVATE_FILE_MODE,
 ) -> None:
     """Write a file privately and atomically in its destination directory."""
-    ensure_private_directory(path.parent)
+    configuration_root = config_root().absolute()
+    absolute_path = path.absolute()
+    if absolute_path != configuration_root and absolute_path.is_relative_to(
+        configuration_root
+    ):
+        ensure_private_directory(
+            configuration_root,
+            preserve_existing_mode=True,
+        )
+        relative_parent = absolute_path.parent.relative_to(configuration_root)
+        private_parent = configuration_root
+        for part in relative_parent.parts:
+            private_parent /= part
+            ensure_private_directory(private_parent)
+    else:
+        ensure_private_directory(path.parent)
     temporary_path: Path | None = None
 
     try:
