@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
+from agent_sherlock.ai import AIConfigurationError, open_message_processor
 from agent_sherlock.application import MessagePipeline, PipelineError
 from agent_sherlock.commands import connections_discord, connections_gmail
 from agent_sherlock.commands.base import Command
@@ -116,11 +117,17 @@ def run(args: argparse.Namespace) -> int:
         destination_name = active_destination_name()
         repository = MessageRepository()
         repository.initialize()
-    except (*DESTINATION_ERRORS, PersistenceError, PipelineError) as exc:
+        processor = open_message_processor()
+    except (
+        *DESTINATION_ERRORS,
+        AIConfigurationError,
+        PersistenceError,
+        PipelineError,
+    ) as exc:
         print_error(exc)
         return 1
 
-    pipeline = MessagePipeline(repository, destination)
+    pipeline = MessagePipeline(repository, destination, processor=processor)
     stop_event = threading.Event()
     workers = _build_workers(
         connected,

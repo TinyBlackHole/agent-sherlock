@@ -202,6 +202,21 @@ def test_watch_reports_discovery_failure_instead_of_connection_guidance(
     assert "Connect an input or enable it" not in output.err
 
 
+def test_watch_rejects_invalid_local_ai_configuration(monkeypatch, capsys):
+    _prepare_connected_watch(monkeypatch, discord=False)
+    monkeypatch.setattr(
+        watch,
+        "open_message_processor",
+        lambda: (_ for _ in ()).throw(
+            watch.AIConfigurationError("configured Ollama model is missing")
+        ),
+    )
+
+    assert main(["watch"]) == 1
+
+    assert "configured Ollama model is missing" in capsys.readouterr().err
+
+
 def test_second_interrupt_forces_exit_from_daemon_workers(monkeypatch, capsys):
     _prepare_connected_watch(monkeypatch)
     created = []

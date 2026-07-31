@@ -9,6 +9,7 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
+from agent_sherlock.ai import AIConfigurationError, open_message_processor
 from agent_sherlock.application import (
     MessageIngestError,
     MessagePipeline,
@@ -220,7 +221,11 @@ def _open_pipeline() -> tuple[DiscordConnector, MessagePipeline]:
     destination = ActiveDestination.open(
         validator=partial(reject_delivery_loop, credentials.channel_id),
     )
-    pipeline = MessagePipeline(MessageRepository(), destination)
+    pipeline = MessagePipeline(
+        MessageRepository(),
+        destination,
+        processor=open_message_processor(),
+    )
     return connector, pipeline
 
 
@@ -245,7 +250,12 @@ def run_watch(_args: argparse.Namespace) -> int:
     try:
         connector, pipeline = _open_pipeline()
         destination_name = active_destination_name()
-    except (DiscordError, *DESTINATION_ERRORS, PersistenceError) as exc:
+    except (
+        DiscordError,
+        *DESTINATION_ERRORS,
+        AIConfigurationError,
+        PersistenceError,
+    ) as exc:
         print_error(exc)
         return 1
 

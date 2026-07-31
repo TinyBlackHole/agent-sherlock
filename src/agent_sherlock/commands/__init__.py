@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from agent_sherlock.commands.ai import COMMAND as ai_command
 from agent_sherlock.commands.base import Command
 from agent_sherlock.commands.connections import COMMAND as connections_command
 from agent_sherlock.commands.output import COMMAND as output_command
@@ -13,6 +14,7 @@ from agent_sherlock.commands.watch import COMMAND as watch_command
 COMMANDS: list[Command] = [
     connections_command,
     output_command,
+    ai_command,
     watch_command,
     purge_command,
 ]

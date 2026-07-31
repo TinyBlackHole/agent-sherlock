@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 from agent_sherlock import input_settings
-from agent_sherlock.application import MessagePipeline, SyncResult
+from agent_sherlock.application import (
+    MessagePipeline,
+    PendingProcessingError,
+    SyncResult,
+)
 from agent_sherlock.cli import main
 from agent_sherlock.commands import (
     connections,
@@ -283,6 +287,32 @@ def test_gmail_watch_retries_rate_limit_with_backoff(monkeypatch, capsys):
     assert connections_gmail.run_watch(argparse.Namespace(interval=30, json=False)) == 0
     assert delays == [30]
     assert "Retrying in 30 seconds" in capsys.readouterr().err
+
+
+def test_gmail_watch_retries_transient_local_ai_failure(monkeypatch, capsys):
+    class RetryableAIError(RuntimeError):
+        retryable = True
+
+    class Pipeline:
+        def sync(self, _connector):
+            raise PendingProcessingError(RetryableAIError("Ollama is loading."))
+
+    delays = []
+
+    def stop_after_delay(delay):
+        delays.append(delay)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        connections_gmail,
+        "_open_pipeline",
+        lambda: (object(), Pipeline()),
+    )
+    monkeypatch.setattr(connections_gmail.time, "sleep", stop_after_delay)
+
+    assert connections_gmail.run_watch(argparse.Namespace(interval=15, json=False)) == 0
+    assert delays == [15]
+    assert "AI processing remains queued" in capsys.readouterr().err
 
 
 def test_gmail_watch_caps_provider_retry_after(monkeypatch, capsys):

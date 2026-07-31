@@ -8,9 +8,11 @@ import threading
 import time
 from pathlib import Path
 
+from agent_sherlock.ai import AIConfigurationError, open_message_processor
 from agent_sherlock.application import (
     MessagePipeline,
     PendingDeliveryError,
+    PendingProcessingError,
     PipelineError,
     SyncResult,
 )
@@ -287,6 +289,7 @@ def _open_pipeline() -> tuple[GmailConnector, MessagePipeline]:
     pipeline = MessagePipeline(
         MessageRepository(),
         ActiveDestination.open(),
+        processor=open_message_processor(),
     )
     return connector, pipeline
 
@@ -295,7 +298,13 @@ def run_fetch(args: argparse.Namespace) -> int:
     try:
         connector, pipeline = _open_pipeline()
         result = pipeline.sync(connector)
-    except (GmailError, *DESTINATION_ERRORS, PersistenceError, PipelineError) as exc:
+    except (
+        GmailError,
+        *DESTINATION_ERRORS,
+        AIConfigurationError,
+        PersistenceError,
+        PipelineError,
+    ) as exc:
         print_error(exc)
         return 1
 
@@ -340,7 +349,12 @@ def run_watch(args: argparse.Namespace) -> int:
     try:
         connector, pipeline = _open_pipeline()
         destination_name = active_destination_name()
-    except (GmailError, *DESTINATION_ERRORS, PersistenceError) as exc:
+    except (
+        GmailError,
+        *DESTINATION_ERRORS,
+        AIConfigurationError,
+        PersistenceError,
+    ) as exc:
         print_error(exc)
         return 1
 
@@ -389,6 +403,18 @@ def watch_connected_gmail(
                 )
                 write_terminal(
                     f"Error: {exc} Delivery remains queued; retrying in "
+                    f"{delay:g} seconds.",
+                    file=sys.stderr,
+                )
+            except PendingProcessingError as exc:
+                consecutive_errors += 1
+                delay = _retry_delay(
+                    exc,
+                    interval=interval,
+                    consecutive_errors=consecutive_errors,
+                )
+                write_terminal(
+                    f"Error: {exc} AI processing remains queued; retrying in "
                     f"{delay:g} seconds.",
                     file=sys.stderr,
                 )

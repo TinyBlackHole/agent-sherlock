@@ -18,9 +18,11 @@ from agent_sherlock.storage import (
     harden_private_file,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DATABASE_BUSY_TIMEOUT_MS = 5_000
 MAX_STORED_ERROR_CHARACTERS = 1_000
+MAX_PROCESSED_TEXT_CHARACTERS = 250_000
+MAX_PROCESSOR_METADATA_CHARACTERS = 1_000
 # A claim is a lease, not a lock: a worker that crashes mid-delivery must not
 # strand its rows, so another worker reclaims them once the lease expires.
 DEFAULT_CLAIM_LEASE_SECONDS = 300.0
@@ -39,7 +41,13 @@ _MESSAGE_COLUMNS = """
     body,
     received_at,
     metadata_json,
-    delivery_attempts
+    delivery_attempts,
+    processed_text,
+    processed_omitted_characters,
+    processor_name,
+    processor_config_hash,
+    processor_model,
+    processor_model_digest
 """
 
 _CREATE_MESSAGES_TABLE = """
@@ -61,6 +69,14 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     last_delivery_error TEXT NOT NULL DEFAULT '',
     claimed_by TEXT NOT NULL DEFAULT '',
     claim_expires_at TEXT,
+    processed_text TEXT,
+    processed_omitted_characters INTEGER NOT NULL DEFAULT 0
+        CHECK (processed_omitted_characters >= 0),
+    processor_name TEXT NOT NULL DEFAULT '',
+    processor_config_hash TEXT NOT NULL DEFAULT '',
+    processor_model TEXT NOT NULL DEFAULT '',
+    processor_model_digest TEXT NOT NULL DEFAULT '',
+    processed_at TEXT,
     delivered_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (source, account_id, external_id)
@@ -124,6 +140,12 @@ class StoredMessage:
     record_id: int
     message: InboundMessage
     delivery_attempts: int
+    processed_text: str | None = None
+    processed_omitted_characters: int = 0
+    processor_name: str = ""
+    processor_config_hash: str = ""
+    processor_model: str = ""
+    processor_model_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +215,7 @@ class MessageRepository:
                     WHERE type = 'table' AND name = 'inbound_messages'
                     """
                 ).fetchone()
-                if current_version in {1, 2} or (
+                if current_version in {1, 2, 3} or (
                     current_version == 0 and has_messages_table is not None
                 ):
                     self._migrate_legacy(connection)
@@ -515,6 +537,66 @@ class MessageRepository:
             worker_id=worker_id,
         )
 
+    def save_processed(
+        self,
+        record_id: int,
+        *,
+        text: str,
+        omitted_characters: int,
+        processor_name: str,
+        processor_config_hash: str,
+        processor_model: str,
+        processor_model_digest: str,
+        processed_at: datetime,
+        worker_id: str,
+    ) -> None:
+        """Persist deterministic delivery text while this worker owns the row."""
+        if not isinstance(text, str) or not text:
+            raise PersistenceError("Processed message text must not be empty.")
+        if len(text) > MAX_PROCESSED_TEXT_CHARACTERS:
+            raise PersistenceError("Processed message text exceeds its safety limit.")
+        if type(omitted_characters) is not int or omitted_characters < 0:
+            raise PersistenceError("Processed omitted-character count is invalid.")
+        metadata = (
+            processor_name,
+            processor_config_hash,
+            processor_model,
+            processor_model_digest,
+        )
+        if any(
+            not isinstance(value, str) or len(value) > MAX_PROCESSOR_METADATA_CHARACTERS
+            for value in metadata
+        ):
+            raise PersistenceError("Processed message metadata is invalid.")
+        if processed_at.tzinfo is None:
+            raise PersistenceError("Processed timestamp must include a timezone.")
+        self._update_delivery(
+            record_id,
+            """
+            UPDATE inbound_messages
+            SET processed_text = ?,
+                processed_omitted_characters = ?,
+                processor_name = ?,
+                processor_config_hash = ?,
+                processor_model = ?,
+                processor_model_digest = ?,
+                processed_at = ?
+            WHERE id = ?
+              AND delivery_status = 'in_flight'
+            """,
+            (
+                text,
+                omitted_characters,
+                processor_name,
+                processor_config_hash,
+                processor_model,
+                processor_model_digest,
+                processed_at.isoformat(),
+                record_id,
+            ),
+            worker_id=worker_id,
+        )
+
     def mark_failed(
         self,
         record_id: int,
@@ -691,6 +773,28 @@ class MessageRepository:
         metadata = json.loads(row[9])
         if not isinstance(metadata, dict):
             raise ValueError("metadata must be an object")
+        processed_text = row[11]
+        processed_omitted = row[12]
+        processor_metadata = row[13:17]
+        if processed_text is not None and (
+            not isinstance(processed_text, str)
+            or not processed_text
+            or len(processed_text) > MAX_PROCESSED_TEXT_CHARACTERS
+        ):
+            raise ValueError("processed text must be text or null")
+        if (
+            isinstance(processed_omitted, bool)
+            or not isinstance(processed_omitted, int)
+            or processed_omitted < 0
+        ):
+            raise ValueError(
+                "processed omitted characters must be a non-negative integer"
+            )
+        if any(
+            not isinstance(value, str) or len(value) > MAX_PROCESSOR_METADATA_CHARACTERS
+            for value in processor_metadata
+        ):
+            raise ValueError("processor metadata must be text")
         return StoredMessage(
             record_id=row[0],
             message=InboundMessage(
@@ -705,4 +809,10 @@ class MessageRepository:
                 metadata=metadata,
             ),
             delivery_attempts=row[10],
+            processed_text=processed_text,
+            processed_omitted_characters=processed_omitted,
+            processor_name=processor_metadata[0],
+            processor_config_hash=processor_metadata[1],
+            processor_model=processor_metadata[2],
+            processor_model_digest=processor_metadata[3],
         )

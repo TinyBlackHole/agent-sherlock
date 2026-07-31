@@ -221,6 +221,92 @@ The bot token is stored under
 protections as the other connections. Never commit the token, and reset it in
 the Developer Portal if it is exposed.
 
+## Process messages locally with Ollama
+
+AI processing is optional and disabled by default. When it is disabled,
+Sherlock forwards the normalized message literally. To keep email content on
+the machine, the supported AI provider is the local Ollama HTTP API; Sherlock
+rejects non-loopback endpoints.
+
+Start the Ollama app or `ollama serve`, install a model, and list what Sherlock
+can use:
+
+```bash
+ollama pull qwen2.5:7b
+sherlock ai models
+```
+
+Select and enable a model:
+
+```bash
+sherlock ai connect ollama --model qwen2.5:7b
+```
+
+The model is configuration, not hardcoded. Change it at any time with:
+
+```bash
+sherlock ai model set another-model:tag
+```
+
+The running watcher reloads AI settings before each message that has not yet
+been processed, so changing the model, prompt, mode, or enabled state does not
+require restarting `sherlock watch`.
+
+Sherlock owns a permanent system context in code. It identifies the model as
+Agent Sherlock, limits its job to transforming a message before forwarding, and
+tells it to treat every email field as untrusted data rather than instructions.
+The user instruction is separate, editable configuration:
+
+```bash
+sherlock ai prompt set "Lee este correo y explícalo en 20 palabras."
+sherlock ai prompt set \
+  "Resume el correo y debajo adjunta una posible respuesta."
+sherlock ai prompt show
+```
+
+Long or multiline instructions can be read from a UTF-8 file with
+`sherlock ai prompt set --file /path/to/instruction.txt`.
+
+The default `augment` mode sends the original message followed by the AI result.
+Use `replace` to send only the transformation:
+
+```bash
+sherlock ai mode augment
+sherlock ai mode replace
+```
+
+Verify the connection and instruction without reading Gmail:
+
+```bash
+sherlock ai status
+sherlock ai test
+```
+
+Disable processing without losing the selected model or prompt:
+
+```bash
+sherlock ai disable
+sherlock ai enable
+```
+
+Settings live in `~/.config/agent-sherlock/ai.json` with private permissions.
+The Ollama API is unauthenticated locally, so leave it bound to loopback.
+Sherlock rejects model names marked as cloud models. For defense in depth,
+disable Ollama cloud features too by setting `OLLAMA_NO_CLOUD=1` before starting
+the server, or put `{"disable_ollama_cloud": true}` in
+`~/.ollama/server.json`, then restart Ollama. Sherlock uses structured,
+non-streaming output with bounded input, output, response size, and request
+time. The machine and Ollama must remain running while `sherlock watch` is
+active.
+
+Each AI result, model name, configured model digest, and configuration
+fingerprint are saved in SQLite before Telegram or Discord is contacted. A
+destination retry therefore reuses exactly the same text instead of invoking
+the model again. Prompt/model changes affect only new messages and queued
+messages that have not yet been processed. If Ollama is unavailable, Sherlock
+keeps the original message queued and does not silently fall back to forwarding
+it unprocessed.
+
 ## Watch every active input
 
 The normal way to run Sherlock is:
@@ -348,6 +434,12 @@ Gmail / Discord / future inputs
 concurrent watchers -> InboundMessage -> SQLite inbox
                                            |
                                            v
+                         plain text or local Ollama
+                                           |
+                                           v
+                         cached processed result
+                                           |
+                                           v
                       serialized delivery -> Telegram chat or Discord channel
 ```
 
@@ -356,10 +448,9 @@ The active destination is stored in
 `MessageDestination` protocol, so inputs never know which one is configured.
 Paused-input settings are stored in
 `~/.config/agent-sherlock/inputs.json`; connected inputs are enabled by default.
-
-The current processor forwards a safe plain-text representation. An AI provider
-can be inserted at that boundary later without coupling it to Gmail, Discord, or
-Telegram.
+The same processor boundary supports literal forwarding and local Ollama
+without coupling either behavior to Gmail, Discord, Telegram, or the Discord
+webhook.
 
 ## Adding a command
 

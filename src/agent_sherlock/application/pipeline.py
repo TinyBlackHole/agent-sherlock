@@ -54,6 +54,18 @@ class MessageProcessingError(PipelineError):
     """Raised when a queued message cannot be transformed safely."""
 
 
+class PendingProcessingError(MessageProcessingError):
+    """Raised when transient local processing failed and remains queued."""
+
+    def __init__(self, cause: Exception):
+        super().__init__(str(cause))
+        self.cause = cause
+
+    @property
+    def retry_after(self) -> object | None:
+        return getattr(self.cause, "retry_after", None)
+
+
 class PendingDeliveryError(PipelineError):
     """Raised when destination delivery failed but the message remains queued."""
 
@@ -72,6 +84,10 @@ class ProcessedMessage:
 
     text: str
     omitted_characters: int = 0
+    processor_name: str = "plain"
+    processor_config_hash: str = ""
+    processor_model: str = ""
+    processor_model_digest: str = ""
 
 
 class MessageProcessor(Protocol):
@@ -87,7 +103,7 @@ class _TrimmedText:
 
 
 class PlainMessageProcessor:
-    """Temporary deterministic processor until an AI provider is configured."""
+    """Deterministic processor used while local AI is disabled."""
 
     def __init__(self, max_body_characters: int | None = None):
         self.max_body_characters = (
@@ -251,12 +267,37 @@ class MessagePipeline:
         )
 
     def _deliver_one(self, stored_message: StoredMessage) -> DeliveryResult:
-        try:
-            processed = _as_processed(self.processor.process(stored_message.message))
-        except Exception as exc:
-            raise MessageProcessingError(
-                "Cannot process a queued message safely."
-            ) from exc
+        if stored_message.processed_text is None:
+            try:
+                processed = _as_processed(
+                    self.processor.process(stored_message.message)
+                )
+            except Exception as exc:
+                if getattr(exc, "retryable", False) is True:
+                    raise PendingProcessingError(exc) from exc
+                raise MessageProcessingError(
+                    f"Cannot process a queued message safely: {exc}"
+                ) from exc
+            self.repository.save_processed(
+                stored_message.record_id,
+                text=processed.text,
+                omitted_characters=processed.omitted_characters,
+                processor_name=processed.processor_name,
+                processor_config_hash=processed.processor_config_hash,
+                processor_model=processed.processor_model,
+                processor_model_digest=processed.processor_model_digest,
+                processed_at=datetime.now(UTC),
+                worker_id=self.worker_id,
+            )
+        else:
+            processed = ProcessedMessage(
+                text=stored_message.processed_text,
+                omitted_characters=stored_message.processed_omitted_characters,
+                processor_name=stored_message.processor_name,
+                processor_config_hash=stored_message.processor_config_hash,
+                processor_model=stored_message.processor_model,
+                processor_model_digest=stored_message.processor_model_digest,
+            )
 
         try:
             self.destination.send(processed.text)
