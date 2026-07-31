@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from agent_sherlock import ai as ai_settings
 from agent_sherlock.cli import main
 from agent_sherlock.commands import ai as ai_command
@@ -12,6 +14,12 @@ class FakeOllamaClient:
         return (
             OllamaModel(name="qwen2.5:7b", digest="digest-7b", size=4_000),
             OllamaModel(name="tiny:latest", digest="digest-tiny", size=1_000),
+        )
+
+    def chat(self, **_kwargs):
+        return SimpleNamespace(
+            supplement="Synthetic summary.",
+            model="qwen2.5:7b",
         )
 
 
@@ -107,6 +115,53 @@ def test_ai_disable_preserves_settings(monkeypatch, capsys):
     assert config.model == "qwen2.5:7b"
     assert config.prompt == "Draft a reply."
     assert "forwarded literally" in capsys.readouterr().out
+
+
+def test_ai_enable_status_mode_and_test(monkeypatch, capsys):
+    monkeypatch.setattr(ai_settings, "OllamaClient", FakeOllamaClient)
+    monkeypatch.setattr(ai_command, "OllamaClient", FakeOllamaClient)
+    ai_settings.save_ai_config(
+        ai_settings.AIConfig(
+            enabled=False,
+            model="qwen2.5:7b",
+            prompt="Summarize.\nDraft a reply.",
+        )
+    )
+
+    assert main(["ai", "enable"]) == 0
+    assert main(["ai", "mode"]) == 0
+    assert main(["ai", "status"]) == 0
+    assert main(["ai", "test"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Local AI enabled" in output
+    assert "AI delivery mode: augment" in output
+    assert "Ollama status: ready" in output
+    assert "  Summarize." in output
+    assert "  Draft a reply." in output
+    assert "Synthetic summary." in output
+
+
+def test_ai_prompt_file_normalizes_windows_line_endings(tmp_path):
+    prompt_file = tmp_path / "instruction.txt"
+    prompt_file.write_bytes(b"Summarize this.\r\nDraft a reply.\r")
+
+    assert main(["ai", "prompt", "set", "--file", str(prompt_file)]) == 0
+
+    assert ai_settings.load_ai_config().prompt == "Summarize this.\nDraft a reply."
+
+
+def test_ai_prompt_configuration_failure_returns_operational_error(
+    monkeypatch,
+    capsys,
+):
+    def fail_save(_config):
+        raise ai_settings.AIConfigurationError("configuration is read-only")
+
+    monkeypatch.setattr(ai_command, "save_ai_config", fail_save)
+
+    assert main(["ai", "prompt", "set", "Summarize."]) == 1
+    assert "configuration is read-only" in capsys.readouterr().err
 
 
 def test_ai_connect_rejects_remote_endpoint(capsys):

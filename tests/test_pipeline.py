@@ -462,7 +462,7 @@ def test_repository_migrates_v1_delivery_status_for_dead_letters(tmp_path):
         status = connection.execute(
             "SELECT delivery_status FROM inbound_messages"
         ).fetchone()[0]
-    assert version == 4
+    assert version == 5
     assert status == "dead_letter"
 
 
@@ -737,6 +737,6 @@ def test_repository_migrates_a_v2_database_and_keeps_queued_work(tmp_path):
 
     with sqlite3.connect(path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 4
+    assert version == 5
     assert [message.message.external_id for message in claimed] == ["queued"]
     assert claimed[0].delivery_attempts == 2

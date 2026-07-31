@@ -7,6 +7,7 @@ from agent_sherlock.application import (
     DeliveryResult,
     MessageIngestError,
     PendingDeliveryError,
+    PendingProcessingError,
     PipelineError,
 )
 from agent_sherlock.cli import main
@@ -17,6 +18,7 @@ from agent_sherlock.integrations.discord import (
     DiscordStatus,
     DiscordWatchError,
 )
+from agent_sherlock.integrations.ollama import OllamaUnavailableError
 from agent_sherlock.integrations.telegram import TelegramError
 from agent_sherlock.persistence import PersistenceError
 
@@ -237,7 +239,8 @@ def test_discord_watch_ingests_gateway_message(monkeypatch, capsys):
             self.stored.append(messages)
             return len(messages)
 
-        def deliver_pending(self):
+        def deliver_pending(self, *, limit):
+            assert limit == 1
             self.deliveries += 1
             if self.deliveries == 1:
                 return DeliveryResult(delivered=1)
@@ -291,7 +294,8 @@ def test_discord_watch_stops_when_a_gateway_event_cannot_be_stored(
         def store(self, _messages):
             raise MessageIngestError(PersistenceError("database is locked"))
 
-        def deliver_pending(self):
+        def deliver_pending(self, *, limit):
+            assert limit == 1
             return DeliveryResult()
 
     def fake_watch(
@@ -340,7 +344,8 @@ def test_discord_watch_keeps_gateway_alive_after_delivery_errors(monkeypatch, ca
         def store(self, _messages):
             return 1
 
-        def deliver_pending(self):
+        def deliver_pending(self, *, limit):
+            assert limit == 1
             raise PipelineError("cannot process queued message")
 
     def fake_watch(
@@ -392,7 +397,8 @@ def test_discord_watch_backs_off_instead_of_retrying_on_every_event(
         def store(self, _messages):
             return 1
 
-        def deliver_pending(self):
+        def deliver_pending(self, *, limit):
+            assert limit == 1
             self.attempts += 1
             raise PendingDeliveryError(TelegramError("Telegram unavailable"))
 
@@ -421,6 +427,51 @@ def test_discord_watch_backs_off_instead_of_retrying_on_every_event(
 
     assert pipeline.attempts == 1
     assert capsys.readouterr().err.count("Telegram unavailable") == 1
+
+
+def test_discord_watch_labels_ai_processing_backoff(monkeypatch, capsys):
+    normalized = inbound_message()
+
+    class Connector:
+        credentials = credentials()
+
+        def normalize(self, _message):
+            return normalized
+
+    class Pipeline:
+        def store(self, _messages):
+            return 1
+
+        def deliver_pending(self, *, limit):
+            assert limit == 1
+            raise PendingProcessingError(
+                OllamaUnavailableError("Ollama is unavailable")
+            )
+
+    def fake_watch(
+        _credentials,
+        handler,
+        *,
+        on_ready_callback,
+        on_maintenance_callback,
+        stop_event,
+    ):
+        on_ready_callback()
+        handler("gateway-event")
+
+    monkeypatch.setattr(
+        connections_discord,
+        "_open_pipeline",
+        lambda: (Connector(), Pipeline()),
+    )
+    monkeypatch.setattr(connections_discord, "watch_discord", fake_watch)
+
+    assert main(["connections", "discord", "watch"]) == 0
+
+    error = capsys.readouterr().err
+    assert "AI processing remains queued" in error
+    assert "Discord watch remains connected" in error
+    assert "queued delivery" not in error
 
 
 def test_delivery_schedule_grows_and_resets_its_backoff():
@@ -479,7 +530,8 @@ def test_discord_watch_explains_how_to_resolve_an_output_conflict(
         def store(self, _messages):
             return 1
 
-        def deliver_pending(self):
+        def deliver_pending(self, *, limit):
+            assert limit == 1
             raise PendingDeliveryError(conflict)
 
     def fake_watch(

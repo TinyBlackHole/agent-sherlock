@@ -268,7 +268,10 @@ Long or multiline instructions can be read from a UTF-8 file with
 `sherlock ai prompt set --file /path/to/instruction.txt`.
 
 The default `augment` mode sends the original message followed by the AI result.
-Use `replace` to send only the transformation:
+Its combined output is capped at 1 900 characters so summaries and suggested
+replies normally remain readable directly in Discord and Telegram instead of
+becoming attachments. A long original or AI result is visibly truncated; use
+`replace` when the transformation itself needs more room:
 
 ```bash
 sherlock ai mode augment
@@ -296,16 +299,20 @@ disable Ollama cloud features too by setting `OLLAMA_NO_CLOUD=1` before starting
 the server, or put `{"disable_ollama_cloud": true}` in
 `~/.ollama/server.json`, then restart Ollama. Sherlock uses structured,
 non-streaming output with bounded input, output, response size, and request
-time. The machine and Ollama must remain running while `sherlock watch` is
-active.
+time. The watcher does not contact Ollama during startup: if the local service
+is temporarily stopped, inputs stay connected and processing retries from the
+durable queue after Ollama returns.
 
-Each AI result, model name, configured model digest, and configuration
-fingerprint are saved in SQLite before Telegram or Discord is contacted. A
-destination retry therefore reuses exactly the same text instead of invoking
-the model again. Prompt/model changes affect only new messages and queued
-messages that have not yet been processed. If Ollama is unavailable, Sherlock
-keeps the original message queued and does not silently fall back to forwarding
-it unprocessed.
+Each AI result, model name, and configured model digest are saved in SQLite
+before Telegram or Discord is contacted. A destination retry therefore reuses
+exactly the same text instead of invoking the model again. Prompt/model changes
+affect only new messages and queued messages that have not yet been processed.
+If Ollama is unavailable, Sherlock keeps the original message queued and does
+not silently fall back to forwarding it unprocessed. Transient Ollama failures
+retry indefinitely. A non-retryable processing failure is quarantined in the
+dead-letter queue after three attempts, allowing later messages to continue.
+Discord processes at most one durable row per Gateway callback so a slow local
+inference cannot turn one event into a 100-message blocking batch.
 
 ## Watch every active input
 

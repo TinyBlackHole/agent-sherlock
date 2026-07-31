@@ -20,6 +20,7 @@ from agent_sherlock.persistence import (
 )
 
 MAX_DELIVERY_ATTEMPTS = 3
+MAX_PROCESSING_ATTEMPTS = 3
 MAX_DELIVERY_HEADER_CHARACTERS = 500
 # How much of a stored message body a single delivery carries. This processor
 # does not alter persistence; whatever does not fit is announced inside the
@@ -55,7 +56,7 @@ class MessageProcessingError(PipelineError):
 
 
 class PendingProcessingError(MessageProcessingError):
-    """Raised when transient local processing failed and remains queued."""
+    """Raised when local processing failed but the message remains queued."""
 
     def __init__(self, cause: Exception):
         super().__init__(str(cause))
@@ -85,7 +86,6 @@ class ProcessedMessage:
     text: str
     omitted_characters: int = 0
     processor_name: str = "plain"
-    processor_config_hash: str = ""
     processor_model: str = ""
     processor_model_digest: str = ""
 
@@ -273,7 +273,25 @@ class MessagePipeline:
                     self.processor.process(stored_message.message)
                 )
             except Exception as exc:
-                if getattr(exc, "retryable", False) is True:
+                retryable = getattr(exc, "retryable", None)
+                if type(retryable) is bool:
+                    attempt = stored_message.processing_attempts + 1
+                    if _should_dead_letter(
+                        exc,
+                        attempt=attempt,
+                        maximum_attempts=MAX_PROCESSING_ATTEMPTS,
+                    ):
+                        self.repository.mark_processing_dead_letter(
+                            stored_message.record_id,
+                            str(exc),
+                            worker_id=self.worker_id,
+                        )
+                        return DeliveryResult(dead_lettered=1)
+                    self.repository.mark_processing_failed(
+                        stored_message.record_id,
+                        str(exc),
+                        worker_id=self.worker_id,
+                    )
                     raise PendingProcessingError(exc) from exc
                 raise MessageProcessingError(
                     f"Cannot process a queued message safely: {exc}"
@@ -283,7 +301,6 @@ class MessagePipeline:
                 text=processed.text,
                 omitted_characters=processed.omitted_characters,
                 processor_name=processed.processor_name,
-                processor_config_hash=processed.processor_config_hash,
                 processor_model=processed.processor_model,
                 processor_model_digest=processed.processor_model_digest,
                 processed_at=datetime.now(UTC),
@@ -294,7 +311,6 @@ class MessagePipeline:
                 text=stored_message.processed_text,
                 omitted_characters=stored_message.processed_omitted_characters,
                 processor_name=stored_message.processor_name,
-                processor_config_hash=stored_message.processor_config_hash,
                 processor_model=stored_message.processor_model,
                 processor_model_digest=stored_message.processor_model_digest,
             )
@@ -303,7 +319,11 @@ class MessagePipeline:
             self.destination.send(processed.text)
         except Exception as exc:
             attempt = stored_message.delivery_attempts + 1
-            if _should_dead_letter(exc, attempt=attempt):
+            if _should_dead_letter(
+                exc,
+                attempt=attempt,
+                maximum_attempts=MAX_DELIVERY_ATTEMPTS,
+            ):
                 self.repository.mark_dead_letter(
                     stored_message.record_id,
                     str(exc),
@@ -382,10 +402,14 @@ def _default_worker_id() -> str:
     return f"{host[:64]}:{os.getpid()}:{secrets.token_hex(4)}"
 
 
-def _should_dead_letter(exception: Exception, *, attempt: int) -> bool:
+def _should_dead_letter(
+    exception: Exception,
+    *,
+    attempt: int,
+    maximum_attempts: int,
+) -> bool:
     return (
-        getattr(exception, "retryable", None) is False
-        and attempt >= MAX_DELIVERY_ATTEMPTS
+        getattr(exception, "retryable", None) is False and attempt >= maximum_attempts
     )
 
 

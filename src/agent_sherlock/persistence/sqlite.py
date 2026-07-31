@@ -18,7 +18,7 @@ from agent_sherlock.storage import (
     harden_private_file,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DATABASE_BUSY_TIMEOUT_MS = 5_000
 MAX_STORED_ERROR_CHARACTERS = 1_000
 MAX_PROCESSED_TEXT_CHARACTERS = 250_000
@@ -45,9 +45,9 @@ _MESSAGE_COLUMNS = """
     processed_text,
     processed_omitted_characters,
     processor_name,
-    processor_config_hash,
     processor_model,
-    processor_model_digest
+    processor_model_digest,
+    processing_attempts
 """
 
 _CREATE_MESSAGES_TABLE = """
@@ -73,9 +73,11 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     processed_omitted_characters INTEGER NOT NULL DEFAULT 0
         CHECK (processed_omitted_characters >= 0),
     processor_name TEXT NOT NULL DEFAULT '',
-    processor_config_hash TEXT NOT NULL DEFAULT '',
     processor_model TEXT NOT NULL DEFAULT '',
     processor_model_digest TEXT NOT NULL DEFAULT '',
+    processing_attempts INTEGER NOT NULL DEFAULT 0
+        CHECK (processing_attempts >= 0),
+    last_processing_error TEXT NOT NULL DEFAULT '',
     processed_at TEXT,
     delivered_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -113,16 +115,29 @@ _LEGACY_COLUMNS = (
     "created_at",
 )
 
+_V4_MIGRATION_COLUMNS = (
+    *_LEGACY_COLUMNS,
+    "processed_text",
+    "processed_omitted_characters",
+    "processor_name",
+    "processor_model",
+    "processor_model_digest",
+    "processed_at",
+)
+
 
 def _with_message_columns(statement: str) -> str:
     """Insert the fixed projection used to deserialize stored messages."""
     return statement.replace("{message_columns}", _MESSAGE_COLUMNS)
 
 
-def _with_legacy_columns(statement: str) -> str:
-    """Insert only the fixed, versioned legacy column allowlist."""
-    columns = ",\n                ".join(_LEGACY_COLUMNS)
-    return statement.replace("{legacy_columns}", columns)
+def _with_migration_columns(
+    statement: str,
+    columns: tuple[str, ...],
+) -> str:
+    """Insert only a fixed, versioned migration column allowlist."""
+    projection = ",\n                ".join(columns)
+    return statement.replace("{migration_columns}", projection)
 
 
 def _with_record_id_placeholders(statement: str, count: int) -> str:
@@ -143,9 +158,9 @@ class StoredMessage:
     processed_text: str | None = None
     processed_omitted_characters: int = 0
     processor_name: str = ""
-    processor_config_hash: str = ""
     processor_model: str = ""
     processor_model_digest: str = ""
+    processing_attempts: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,10 +230,10 @@ class MessageRepository:
                     WHERE type = 'table' AND name = 'inbound_messages'
                     """
                 ).fetchone()
-                if current_version in {1, 2, 3} or (
+                if current_version in {1, 2, 3, 4} or (
                     current_version == 0 and has_messages_table is not None
                 ):
-                    self._migrate_legacy(connection)
+                    self._migrate_legacy(connection, current_version=current_version)
                 else:
                     self._create_current_schema(connection)
             if os.name == "posix":
@@ -257,8 +272,15 @@ class MessageRepository:
         connection.commit()
 
     @staticmethod
-    def _migrate_legacy(connection: sqlite3.Connection) -> None:
+    def _migrate_legacy(
+        connection: sqlite3.Connection,
+        *,
+        current_version: int,
+    ) -> None:
         """Rebuild any older schema into the current one, preserving every row."""
+        migration_columns = (
+            _V4_MIGRATION_COLUMNS if current_version == 4 else _LEGACY_COLUMNS
+        )
         connection.execute("BEGIN IMMEDIATE")
         try:
             connection.execute("DROP INDEX IF EXISTS idx_inbound_pending")
@@ -270,15 +292,16 @@ class MessageRepository:
             connection.execute(_CREATE_PENDING_INDEX)
             connection.execute(_CREATE_RETENTION_INDEX)
             connection.execute(
-                _with_legacy_columns(
+                _with_migration_columns(
                     """
                 INSERT INTO inbound_messages (
-                    {legacy_columns}
+                    {migration_columns}
                 )
                 SELECT
-                    {legacy_columns}
+                    {migration_columns}
                 FROM inbound_messages_legacy;
-                """
+                """,
+                    migration_columns,
                 )
             )
             connection.execute("DROP TABLE inbound_messages_legacy")
@@ -544,7 +567,6 @@ class MessageRepository:
         text: str,
         omitted_characters: int,
         processor_name: str,
-        processor_config_hash: str,
         processor_model: str,
         processor_model_digest: str,
         processed_at: datetime,
@@ -559,7 +581,6 @@ class MessageRepository:
             raise PersistenceError("Processed omitted-character count is invalid.")
         metadata = (
             processor_name,
-            processor_config_hash,
             processor_model,
             processor_model_digest,
         )
@@ -577,9 +598,9 @@ class MessageRepository:
             SET processed_text = ?,
                 processed_omitted_characters = ?,
                 processor_name = ?,
-                processor_config_hash = ?,
                 processor_model = ?,
                 processor_model_digest = ?,
+                last_processing_error = '',
                 processed_at = ?
             WHERE id = ?
               AND delivery_status = 'in_flight'
@@ -588,10 +609,60 @@ class MessageRepository:
                 text,
                 omitted_characters,
                 processor_name,
-                processor_config_hash,
                 processor_model,
                 processor_model_digest,
                 processed_at.isoformat(),
+                record_id,
+            ),
+            worker_id=worker_id,
+        )
+
+    def mark_processing_failed(
+        self,
+        record_id: int,
+        error: str,
+        *,
+        worker_id: str,
+    ) -> None:
+        """Record a failed transformation and return the row to the queue."""
+        self._update_delivery(
+            record_id,
+            """
+            UPDATE inbound_messages
+            SET delivery_status = 'pending',
+                processing_attempts = processing_attempts + 1,
+                last_processing_error = ?,
+                claimed_by = '',
+                claim_expires_at = NULL
+            WHERE id = ?
+            """,
+            (self._safe_error(error), record_id),
+            worker_id=worker_id,
+        )
+
+    def mark_processing_dead_letter(
+        self,
+        record_id: int,
+        error: str,
+        *,
+        worker_id: str,
+    ) -> None:
+        """Quarantine a message that repeatedly fails deterministic processing."""
+        self._update_delivery(
+            record_id,
+            """
+            UPDATE inbound_messages
+            SET delivery_status = 'dead_letter',
+                processing_attempts = processing_attempts + 1,
+                last_processing_error = ?,
+                claimed_by = '',
+                claim_expires_at = NULL,
+                delivered_at = ?
+            WHERE id = ?
+            """,
+            (
+                self._safe_error(error),
+                datetime.now(UTC).isoformat(),
                 record_id,
             ),
             worker_id=worker_id,
@@ -775,7 +846,8 @@ class MessageRepository:
             raise ValueError("metadata must be an object")
         processed_text = row[11]
         processed_omitted = row[12]
-        processor_metadata = row[13:17]
+        processor_metadata = row[13:16]
+        processing_attempts = row[16]
         if processed_text is not None and (
             not isinstance(processed_text, str)
             or not processed_text
@@ -795,6 +867,12 @@ class MessageRepository:
             for value in processor_metadata
         ):
             raise ValueError("processor metadata must be text")
+        if (
+            isinstance(processing_attempts, bool)
+            or not isinstance(processing_attempts, int)
+            or processing_attempts < 0
+        ):
+            raise ValueError("processing attempts must be a non-negative integer")
         return StoredMessage(
             record_id=row[0],
             message=InboundMessage(
@@ -812,7 +890,7 @@ class MessageRepository:
             processed_text=processed_text,
             processed_omitted_characters=processed_omitted,
             processor_name=processor_metadata[0],
-            processor_config_hash=processor_metadata[1],
-            processor_model=processor_metadata[2],
-            processor_model_digest=processor_metadata[3],
+            processor_model=processor_metadata[1],
+            processor_model_digest=processor_metadata[2],
+            processing_attempts=processing_attempts,
         )

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -36,6 +35,8 @@ DEFAULT_KEEP_ALIVE = "5m"
 DEFAULT_MAX_INPUT_CHARACTERS = 12_000
 DEFAULT_MAX_OUTPUT_TOKENS = 600
 DEFAULT_TEMPERATURE = 0.0
+MAX_INLINE_AUGMENT_CHARACTERS = 1_900
+MAX_INLINE_AUGMENT_SUPPLEMENT_CHARACTERS = 1_000
 MAX_PROMPT_CHARACTERS = 8_000
 MIN_MAX_INPUT_CHARACTERS = 500
 MAX_MAX_INPUT_CHARACTERS = 100_000
@@ -87,29 +88,6 @@ class AIConfig:
     temperature: float = DEFAULT_TEMPERATURE
     max_input_characters: int = DEFAULT_MAX_INPUT_CHARACTERS
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
-
-    @property
-    def fingerprint(self) -> str:
-        relevant = {
-            "base_url": self.base_url,
-            "keep_alive": self.keep_alive,
-            "max_input_characters": self.max_input_characters,
-            "max_output_tokens": self.max_output_tokens,
-            "mode": self.mode,
-            "model": self.model,
-            "model_digest": self.model_digest,
-            "prompt": self.prompt,
-            "provider": self.provider,
-            "system_prompt_version": SYSTEM_PROMPT_VERSION,
-            "temperature": self.temperature,
-        }
-        canonical = json.dumps(
-            relevant,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def ai_config_path() -> Path:
@@ -169,12 +147,12 @@ def select_model(config: AIConfig, model: OllamaModel) -> AIConfig:
 
 def open_message_processor() -> ConfiguredMessageProcessor:
     config = load_ai_config()
-    if config.enabled:
-        if not config.model:
-            raise AIConfigurationError(
-                "Local AI is enabled but no Ollama model is selected."
-            )
-        configured_model(config)
+    if config.enabled and not config.model:
+        raise AIConfigurationError(
+            "Local AI is enabled but no Ollama model is selected."
+        )
+    # Do not contact Ollama during watcher startup. A temporarily stopped local
+    # service is handled per message and retried without taking inputs offline.
     return ConfiguredMessageProcessor()
 
 
@@ -249,16 +227,29 @@ class OllamaMessageProcessor:
             omitted_characters = input_omitted
         else:
             original = self.plain_processor.process(message)
-            text = f"{original.text}\n\n---\nAgent Sherlock AI\n{supplement}"
+            supplement, supplement_omitted = _trim_for_delivery(
+                supplement,
+                MAX_INLINE_AUGMENT_SUPPLEMENT_CHARACTERS,
+            )
+            separator = "\n\n---\nAgent Sherlock AI\n"
+            original_budget = max(
+                MAX_INLINE_AUGMENT_CHARACTERS - len(separator) - len(supplement),
+                0,
+            )
+            original_text, additional_original_omitted = _trim_for_delivery(
+                original.text,
+                original_budget,
+            )
+            text = f"{original_text}{separator}{supplement}"
             omitted_characters = max(
-                original.omitted_characters,
+                original.omitted_characters + additional_original_omitted,
                 input_omitted,
+                supplement_omitted,
             )
         return ProcessedMessage(
             text=text,
             omitted_characters=omitted_characters,
             processor_name=self.processor_name,
-            processor_config_hash=self.config.fingerprint,
             processor_model=result.model or self.config.model,
             processor_model_digest=self.config.model_digest,
         )
@@ -414,6 +405,14 @@ def _trim(value: str, limit: int) -> tuple[str, int]:
     if len(value) <= limit:
         return value, 0
     return value[:limit], len(value) - limit
+
+
+def _trim_for_delivery(value: str, limit: int) -> tuple[str, int]:
+    if len(value) <= limit:
+        return value, 0
+    if limit <= 1:
+        return value[:limit], len(value) - limit
+    return f"{value[: limit - 1]}…", len(value) - (limit - 1)
 
 
 def _is_cloud_model_name(name: str) -> bool:

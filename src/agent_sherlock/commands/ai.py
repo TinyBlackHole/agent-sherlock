@@ -237,7 +237,7 @@ def run_prompt_set(args: argparse.Namespace) -> int:
         save_ai_config(replace(config, prompt=text))
     except AIConfigurationError as exc:
         print_error(exc)
-        return 2
+        return 1
     print("AI instruction updated for new, unprocessed messages.")
     return 0
 
@@ -305,7 +305,8 @@ def run_status(_args: argparse.Namespace) -> int:
     print(f"Delivery mode: {config.mode}")
     print(f"Permanent Agent Sherlock context: built in (v{SYSTEM_PROMPT_VERSION})")
     print("User instruction:")
-    print(f"  {config.prompt.replace(chr(10), chr(10) + '  ')}")
+    for line in config.prompt.splitlines() or [""]:
+        print(f"  {terminal_safe(line, fallback='')}")
     if not config.model:
         return 0 if not config.enabled else 1
     try:
@@ -316,7 +317,7 @@ def run_status(_args: argparse.Namespace) -> int:
                 timeout=STATUS_REQUEST_TIMEOUT_SECONDS,
             ),
         )
-    except AIConfigurationError as exc:
+    except (AIConfigurationError, OllamaError) as exc:
         print(f"Ollama status: unavailable ({exc})")
         return 1
     digest_changed = bool(
@@ -371,12 +372,20 @@ def _find_model(models: tuple[OllamaModel, ...], name: str) -> OllamaModel:
 
 def _read_prompt_file(path: Path) -> str | None:
     try:
-        if not path.is_file() or path.stat().st_size > MAX_PROMPT_CHARACTERS * 4:
-            raise OSError
-        return path.read_text(encoding="utf-8").strip()
+        is_file = path.is_file()
+        size = path.stat().st_size if is_file else 0
     except (OSError, UnicodeError):
         print(f"Error: cannot read AI instruction file: {path}", file=sys.stderr)
         return None
+    if not is_file or size > MAX_PROMPT_CHARACTERS * 4:
+        print(f"Error: cannot read AI instruction file: {path}", file=sys.stderr)
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        print(f"Error: cannot read AI instruction file: {path}", file=sys.stderr)
+        return None
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 COMMAND = Command(

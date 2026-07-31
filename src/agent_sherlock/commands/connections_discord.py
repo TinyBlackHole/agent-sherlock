@@ -14,6 +14,7 @@ from agent_sherlock.application import (
     MessageIngestError,
     MessagePipeline,
     PendingDeliveryError,
+    PendingProcessingError,
     PipelineError,
 )
 from agent_sherlock.commands.connections_shared import (
@@ -318,7 +319,18 @@ def watch_connected_discord(
         if not schedule.ready():
             return
         try:
-            result = pipeline.deliver_pending()
+            # A local model may take seconds per message. Process one durable
+            # row per Gateway callback so a backlog cannot multiply that
+            # latency by the pipeline's normal 100-message batch size.
+            result = pipeline.deliver_pending(limit=1)
+        except PendingProcessingError as exc:
+            delay = schedule.failed(retry_after=_retry_after_seconds(exc))
+            write_terminal(
+                f"Error: {exc} AI processing remains queued; Discord watch "
+                f"remains connected and will retry in {delay:.0f}s.",
+                file=sys.stderr,
+            )
+            return
         except PendingDeliveryError as exc:
             delay = schedule.failed(retry_after=_retry_after_seconds(exc))
             _print_pending_delivery_error(exc, retry_in_seconds=delay)
@@ -386,7 +398,9 @@ class DeliverySchedule:
         return delay
 
 
-def _retry_after_seconds(exception: PendingDeliveryError) -> float | None:
+def _retry_after_seconds(
+    exception: PendingDeliveryError | PendingProcessingError,
+) -> float | None:
     retry_after = exception.retry_after
     if isinstance(retry_after, bool) or not isinstance(retry_after, int | float):
         return None
