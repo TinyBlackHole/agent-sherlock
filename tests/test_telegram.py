@@ -136,33 +136,78 @@ def test_telegram_api_error_retryability():
     assert telegram.TelegramAPIError("forbidden", status=403).retryable is False
 
 
-def test_long_telegram_messages_are_chunked():
-    chunks = telegram._message_chunks("x" * 8_500)
+def test_telegram_api_response_is_bounded(monkeypatch):
+    requested_read_sizes = []
 
-    assert "".join(chunks) == "x" * 8_500
-    assert all(
-        telegram._utf16_length(chunk) <= telegram.TELEGRAM_SAFE_CHUNK_SIZE
-        for chunk in chunks
+    class Response:
+        status = 200
+
+        def read(self, size):
+            requested_read_sizes.append(size)
+            return b"x" * size
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(telegram, "HTTPSConnection", Connection)
+
+    with pytest.raises(telegram.TelegramAPIError, match="large API response"):
+        telegram.TelegramClient(TOKEN).get_me()
+
+    assert requested_read_sizes == [telegram.MAX_TELEGRAM_API_RESPONSE_BYTES + 1]
+
+
+def test_long_telegram_messages_are_sent_as_one_attachment(monkeypatch):
+    client = telegram.TelegramClient(TOKEN)
+    requests = []
+
+    def fake_request(method, payload=None, **kwargs):
+        requests.append((method, payload, kwargs))
+        return {}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    text = "A" * 9_000
+
+    client.send_message(7, text)
+
+    assert len(requests) == 1
+    method, payload, kwargs = requests[0]
+    assert method == "sendDocument"
+    assert payload is None
+    assert kwargs["content_type"].startswith("multipart/form-data; boundary=")
+    body = kwargs["body"]
+    assert text.encode() in body
+    assert b'name="chat_id"' in body
+    assert telegram.TELEGRAM_ATTACHMENT_FILENAME.encode() in body
+
+
+def test_long_astral_telegram_messages_are_sent_as_one_attachment(monkeypatch):
+    client = telegram.TelegramClient(TOKEN)
+    requests = []
+
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda method, payload=None, **kwargs: requests.append(method) or {},
     )
+    # 4 500 emoji stay under Telegram's character limit but exceed its UTF-16
+    # unit limit, which is what actually bounds a message.
+    client.send_message(7, "\N{GRINNING FACE}" * 4_500)
+
+    assert requests == ["sendDocument"]
 
 
-def test_telegram_chunks_astral_characters_by_utf16_units():
-    text = "😀" * 4_500
-
-    chunks = telegram._message_chunks(text)
-
-    assert "".join(chunks) == text
-    assert all(
-        telegram._utf16_length(chunk) <= telegram.TELEGRAM_SAFE_CHUNK_SIZE
-        for chunk in chunks
-    )
-
-
-def test_utf16_prefix_index_always_advances_for_one_astral_character():
-    assert telegram._utf16_prefix_index("😀", max_units=1) == 1
-
-
-def test_send_message_requests_every_long_text_chunk(monkeypatch):
+def test_short_telegram_messages_are_sent_as_one_plain_message(monkeypatch):
     client = telegram.TelegramClient(TOKEN)
     requests = []
 
@@ -171,10 +216,41 @@ def test_send_message_requests_every_long_text_chunk(monkeypatch):
         return {}
 
     monkeypatch.setattr(client, "_request", fake_request)
-    text = "A" * 9_000
 
-    client.send_message(7, text)
+    client.send_message(7, "short message")
 
-    expected_chunks = telegram._message_chunks(text)
-    assert [payload["text"] for _, payload in requests] == list(expected_chunks)
-    assert all(method == "sendMessage" for method, _ in requests)
+    assert requests == [
+        (
+            "sendMessage",
+            {
+                "chat_id": 7,
+                "disable_web_page_preview": True,
+                "text": "short message",
+            },
+        )
+    ]
+
+
+def test_telegram_attachment_caption_stays_within_the_caption_limit():
+    body, _ = telegram._long_message_request(7, "line\n" * 5_000)
+
+    caption = body.split(b'name="caption"\r\n\r\n', 1)[1].split(b"\r\n--", 1)[0]
+    assert telegram._utf16_length(caption.decode()) <= telegram.TELEGRAM_CAPTION_LIMIT
+
+
+def test_utf16_prefix_index_always_advances_for_one_astral_character():
+    assert telegram._utf16_prefix_index("😀", max_units=1) == 1
+
+
+def test_telegram_credentials_never_repr_their_token():
+    credentials = telegram.TelegramCredentials(
+        token=TOKEN,
+        chat_id=7,
+        bot_id=1,
+        bot_username="sherlock_bot",
+    )
+
+    # A traceback, log line, or failing assertion must not leak the token.
+    assert TOKEN not in repr(credentials)
+    assert "sherlock_bot" in repr(credentials)
+    assert credentials.as_json()["token"] == TOKEN

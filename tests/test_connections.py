@@ -208,6 +208,7 @@ def test_gmail_fetch_json_reports_pipeline_counts(monkeypatch, capsys):
         "history_reset": False,
         "initialized": False,
         "stored": 2,
+        "truncated": 0,
     }
 
 

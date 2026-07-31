@@ -3,7 +3,12 @@ from datetime import UTC, datetime
 import pytest
 
 from agent_sherlock import input_settings
-from agent_sherlock.application import PendingDeliveryError, PipelineError, SyncResult
+from agent_sherlock.application import (
+    DeliveryResult,
+    MessageIngestError,
+    PendingDeliveryError,
+    PipelineError,
+)
 from agent_sherlock.cli import main
 from agent_sherlock.commands import connections, connections_discord
 from agent_sherlock.domain import InboundMessage
@@ -224,12 +229,21 @@ def test_discord_watch_ingests_gateway_message(monkeypatch, capsys):
             return normalized
 
     class Pipeline:
-        def ingest(self, messages):
-            assert messages == (normalized,)
-            return SyncResult(discovered=1, stored=1, delivered=1)
+        def __init__(self):
+            self.stored = []
+            self.deliveries = 0
+
+        def store(self, messages):
+            self.stored.append(messages)
+            return len(messages)
 
         def deliver_pending(self):
-            return SyncResult()
+            self.deliveries += 1
+            if self.deliveries == 1:
+                return DeliveryResult(delivered=1)
+            return DeliveryResult()
+
+    pipeline = Pipeline()
 
     def fake_watch(
         discord_credentials,
@@ -248,19 +262,23 @@ def test_discord_watch_ingests_gateway_message(monkeypatch, capsys):
     monkeypatch.setattr(
         connections_discord,
         "_open_pipeline",
-        lambda: (Connector(), Pipeline()),
+        lambda: (Connector(), pipeline),
     )
     monkeypatch.setattr(connections_discord, "watch_discord", fake_watch)
 
     assert main(["connections", "discord", "watch"]) == 0
 
+    assert pipeline.stored == [(normalized,)]
     output = capsys.readouterr().out
     assert "Forwarding Discord #alerts to telegram" in output
     assert "Sent 1 queued message to the configured output" in output
     assert "Stopped Discord watch" in output
 
 
-def test_discord_watch_keeps_gateway_alive_after_pipeline_errors(monkeypatch, capsys):
+def test_discord_watch_stops_when_a_gateway_event_cannot_be_stored(
+    monkeypatch,
+    capsys,
+):
     normalized = inbound_message()
 
     class Connector:
@@ -270,8 +288,57 @@ def test_discord_watch_keeps_gateway_alive_after_pipeline_errors(monkeypatch, ca
             return normalized
 
     class Pipeline:
-        def ingest(self, _messages):
-            raise PersistenceError("database is locked")
+        def store(self, _messages):
+            raise MessageIngestError(PersistenceError("database is locked"))
+
+        def deliver_pending(self):
+            return DeliveryResult()
+
+    def fake_watch(
+        _credentials,
+        handler,
+        *,
+        on_ready_callback,
+        on_maintenance_callback,
+        stop_event,
+    ):
+        on_ready_callback()
+        # The Gateway aborts the connection when a handler raises, which is
+        # exactly what has to happen: the event is gone and only a reconnect
+        # can resynchronize.
+        try:
+            handler("gateway-event")
+        except MessageIngestError as exc:
+            raise DiscordWatchError(
+                f"Discord message processing stopped: {exc}"
+            ) from exc
+
+    monkeypatch.setattr(
+        connections_discord,
+        "_open_pipeline",
+        lambda: (Connector(), Pipeline()),
+    )
+    monkeypatch.setattr(connections_discord, "watch_discord", fake_watch)
+
+    assert main(["connections", "discord", "watch"]) == 1
+
+    error_output = capsys.readouterr().err
+    assert "Stopping the Discord watch" in error_output
+    assert "processing stopped" in error_output
+
+
+def test_discord_watch_keeps_gateway_alive_after_delivery_errors(monkeypatch, capsys):
+    normalized = inbound_message()
+
+    class Connector:
+        credentials = credentials()
+
+        def normalize(self, _message):
+            return normalized
+
+    class Pipeline:
+        def store(self, _messages):
+            return 1
 
         def deliver_pending(self):
             raise PipelineError("cannot process queued message")
@@ -299,8 +366,98 @@ def test_discord_watch_keeps_gateway_alive_after_pipeline_errors(monkeypatch, ca
     assert main(["connections", "discord", "watch"]) == 0
 
     output = capsys.readouterr()
-    assert output.err.count("Discord watch remains connected") == 2
+    # The event itself was stored, so the watch stays up; the failed delivery is
+    # retried once the backoff window elapses instead of on the next event.
+    assert output.err.count("Discord watch remains connected") == 1
+    assert "will be retried in" in output.err
     assert "Stopped Discord watch" in output.out
+
+
+def test_discord_watch_backs_off_instead_of_retrying_on_every_event(
+    monkeypatch,
+    capsys,
+):
+    normalized = inbound_message()
+
+    class Connector:
+        credentials = credentials()
+
+        def normalize(self, _message):
+            return normalized
+
+    class Pipeline:
+        def __init__(self):
+            self.attempts = 0
+
+        def store(self, _messages):
+            return 1
+
+        def deliver_pending(self):
+            self.attempts += 1
+            raise PendingDeliveryError(TelegramError("Telegram unavailable"))
+
+    pipeline = Pipeline()
+
+    def fake_watch(
+        _credentials,
+        handler,
+        *,
+        on_ready_callback,
+        on_maintenance_callback,
+        stop_event,
+    ):
+        on_ready_callback()
+        for _ in range(20):
+            handler("gateway-event")
+
+    monkeypatch.setattr(
+        connections_discord,
+        "_open_pipeline",
+        lambda: (Connector(), pipeline),
+    )
+    monkeypatch.setattr(connections_discord, "watch_discord", fake_watch)
+
+    assert main(["connections", "discord", "watch"]) == 0
+
+    assert pipeline.attempts == 1
+    assert capsys.readouterr().err.count("Telegram unavailable") == 1
+
+
+def test_delivery_schedule_grows_and_resets_its_backoff():
+    now = [0.0]
+    schedule = connections_discord.DeliverySchedule(
+        initial_seconds=5.0,
+        maximum_seconds=20.0,
+        clock=lambda: now[0],
+    )
+
+    assert schedule.ready() is True
+    assert schedule.failed() == 5.0
+    assert schedule.ready() is False
+
+    now[0] = 5.0
+    assert schedule.ready() is True
+    assert schedule.failed() == 10.0
+    assert schedule.failed() == 20.0
+    assert schedule.failed() == 20.0
+
+    schedule.succeeded()
+    assert schedule.ready() is True
+
+
+def test_delivery_schedule_honours_a_provider_retry_after():
+    now = [0.0]
+    schedule = connections_discord.DeliverySchedule(
+        initial_seconds=5.0,
+        maximum_seconds=600.0,
+        clock=lambda: now[0],
+    )
+
+    assert schedule.failed(retry_after=120.0) == 120.0
+    now[0] = 119.0
+    assert schedule.ready() is False
+    now[0] = 120.0
+    assert schedule.ready() is True
 
 
 def test_discord_watch_explains_how_to_resolve_an_output_conflict(
@@ -319,8 +476,8 @@ def test_discord_watch_explains_how_to_resolve_an_output_conflict(
             return normalized
 
     class Pipeline:
-        def ingest(self, _messages):
-            raise PendingDeliveryError(conflict)
+        def store(self, _messages):
+            return 1
 
         def deliver_pending(self):
             raise PendingDeliveryError(conflict)
@@ -348,8 +505,8 @@ def test_discord_watch_explains_how_to_resolve_an_output_conflict(
     assert main(["connections", "discord", "watch"]) == 0
 
     output = capsys.readouterr()
-    assert output.err.count("Change the output configuration") == 2
-    assert output.err.count("message remains queued until then") == 2
+    assert output.err.count("Change the output configuration") == 1
+    assert output.err.count("message remains queued until then") == 1
     assert "Queued delivery will be retried" not in output.err
 
 

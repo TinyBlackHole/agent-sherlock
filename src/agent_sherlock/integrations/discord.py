@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import threading
@@ -23,6 +24,18 @@ DISCORD_CREDENTIALS_SCHEMA_VERSION = 1
 MAX_DISCORD_TOKEN_CHARACTERS = 512
 MAX_API_RESPONSE_BYTES = 1_000_000
 DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 30.0
+# Gateway events are handed to one consumer through a bounded queue. The bound
+# stops a slow or failing output from letting callback tasks pile up without
+# limit. If the buffer fills, the watcher stops loudly: discord.py dispatches
+# callbacks as independent tasks, so waiting inside one callback would not apply
+# backpressure to the Gateway and would only move the unbounded queue elsewhere.
+MAX_QUEUED_GATEWAY_EVENTS = 256
+EVENT_DRAIN_TIMEOUT_SECONDS = 30.0
+
+# Queue sentinels. Identity comparison keeps them distinguishable from any
+# Discord message object.
+_MAINTENANCE_EVENT = object()
+_SHUTDOWN_EVENT = object()
 
 # Text channels, announcement channels, and their thread variants. Forum and
 # media channels contain messages in child threads rather than in the channel
@@ -360,15 +373,24 @@ def watch_discord(
         def __init__(self) -> None:
             super().__init__(intents=intents, max_messages=None)
             self.failure: Exception | None = None
-            self._ingest_lock: asyncio.Lock | None = None
+            self._events: asyncio.Queue[Any] | None = None
             self._announced_ready = False
             self._ready_event: asyncio.Event | None = None
+            self._maintenance_queued = False
+            self._consumer_task: asyncio.Task[None] | None = None
             self._maintenance_task: asyncio.Task[None] | None = None
             self._shutdown_task: asyncio.Task[None] | None = None
+            self._closing_task: asyncio.Task[None] | None = None
+            self._close_lock: asyncio.Lock | None = None
 
         async def setup_hook(self) -> None:
-            self._ingest_lock = asyncio.Lock()
+            self._events = asyncio.Queue(maxsize=MAX_QUEUED_GATEWAY_EVENTS)
             self._ready_event = asyncio.Event()
+            self._close_lock = asyncio.Lock()
+            self._consumer_task = asyncio.create_task(
+                self._consume_events(),
+                name="sherlock-discord-consumer",
+            )
             if on_maintenance_callback is not None:
                 self._maintenance_task = asyncio.create_task(
                     self._maintain_delivery_queue(),
@@ -402,33 +424,53 @@ def watch_discord(
                 self._ready_event.set()
 
         async def on_message(self, message: Any) -> None:
-            if self._ingest_lock is None:
-                self._ingest_lock = asyncio.Lock()
+            if self._events is None or self.failure is not None:
+                return
             try:
-                async with self._ingest_lock:
-                    if self.failure is not None:
-                        return
-                    await asyncio.to_thread(on_message_callback, message)
-            except Exception as exc:
-                self.failure = exc
-                await self.close()
+                self._events.put_nowait(message)
+            except asyncio.QueueFull:
+                self.failure = DiscordWatchError(
+                    "Discord events arrived faster than Sherlock could store them; "
+                    "the bounded event buffer filled and the watch was stopped."
+                )
+                self._request_close()
+
+        async def _consume_events(self) -> None:
+            """Run every callback on one task, in arrival order."""
+            queue = self._events
+            if queue is None:
+                return
+            while True:
+                event = await queue.get()
+                if event is _SHUTDOWN_EVENT:
+                    return
+                if self.failure is not None:
+                    return
+                try:
+                    if event is _MAINTENANCE_EVENT:
+                        self._maintenance_queued = False
+                        if on_maintenance_callback is not None:
+                            await asyncio.to_thread(on_maintenance_callback)
+                    else:
+                        await asyncio.to_thread(on_message_callback, event)
+                except Exception as exc:
+                    self.failure = exc
+                    self._request_close()
+                    return
 
         async def _maintain_delivery_queue(self) -> None:
             if self._ready_event is None or on_maintenance_callback is None:
                 return
             await self._ready_event.wait()
             while not self.is_closed():
-                try:
-                    if self._ingest_lock is None:
-                        self._ingest_lock = asyncio.Lock()
-                    async with self._ingest_lock:
-                        if self.failure is not None:
-                            return
-                        await asyncio.to_thread(on_maintenance_callback)
-                except Exception as exc:
-                    self.failure = exc
-                    await self.close()
+                if self.failure is not None:
                     return
+                if self._events is not None and not self._maintenance_queued:
+                    with contextlib.suppress(asyncio.QueueFull):
+                        # A full queue already guarantees another delivery pass,
+                        # so a skipped tick costs nothing.
+                        self._events.put_nowait(_MAINTENANCE_EVENT)
+                        self._maintenance_queued = True
                 await asyncio.sleep(maintenance_interval)
 
         async def _watch_for_shutdown(self) -> None:
@@ -438,6 +480,58 @@ def watch_discord(
                 await asyncio.sleep(0.2)
             if stop_event.is_set() and not self.is_closed():
                 await self.close()
+
+        def _request_close(self) -> None:
+            """Close from inside the consumer without awaiting itself."""
+            if self._closing_task is None or self._closing_task.done():
+                self._closing_task = asyncio.create_task(
+                    self.close(),
+                    name="sherlock-discord-close",
+                )
+
+        async def close(self) -> None:
+            if self._close_lock is None:
+                await self._close_once()
+                return
+            async with self._close_lock:
+                await self._close_once()
+
+        async def _close_once(self) -> None:
+            # Stop the socket first so no new events can be appended behind the
+            # shutdown marker while accepted events are being drained.
+            if not self.is_closed():
+                await super().close()
+            await self._drain_events()
+
+        async def _drain_events(self) -> None:
+            task = self._consumer_task
+            queue = self._events
+            if task is None or queue is None or task.done():
+                return
+            if asyncio.current_task() is task:
+                return
+            if self.failure is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                return
+
+            async def stop_after_queued_events() -> None:
+                await queue.put(_SHUTDOWN_EVENT)
+                await task
+
+            try:
+                await asyncio.wait_for(
+                    stop_after_queued_events(),
+                    timeout=EVENT_DRAIN_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                self.failure = DiscordWatchError(
+                    "Timed out while storing accepted Discord events during shutdown."
+                )
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     client = SherlockDiscordClient()
     try:

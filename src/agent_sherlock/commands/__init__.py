@@ -3,10 +3,16 @@ from __future__ import annotations
 from agent_sherlock.commands.base import Command
 from agent_sherlock.commands.connections import COMMAND as connections_command
 from agent_sherlock.commands.output import COMMAND as output_command
+from agent_sherlock.commands.purge import COMMAND as purge_command
 from agent_sherlock.commands.watch import COMMAND as watch_command
 
 # The registry of available `sherlock <command>` subcommands.
 #
 # To add a command: copy `_template.py`, implement it, import the Command
 # instance here, and append it to this list. Order controls help display.
-COMMANDS: list[Command] = [connections_command, output_command, watch_command]
+COMMANDS: list[Command] = [
+    connections_command,
+    output_command,
+    watch_command,
+    purge_command,
+]

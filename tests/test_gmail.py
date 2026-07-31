@@ -489,3 +489,130 @@ def test_status_rejects_token_with_old_metadata_scope(tmp_path):
 
     with pytest.raises(gmail.GmailAuthenticationError, match="outdated permissions"):
         gmail.gmail_status(paths=paths)
+
+
+def test_deeply_nested_mime_tree_is_walked_without_recursion():
+    def part(depth):
+        encoded = urlsafe_b64encode(f"level {depth}".encode()).decode().rstrip("=")
+        return {
+            "mimeType": "text/plain",
+            "headers": [{"name": "Content-Type", "value": "text/plain"}],
+            "body": {"data": encoded},
+        }
+
+    payload = part(0)
+    deepest = payload
+    for depth in range(1, 1_200):
+        child = part(depth)
+        deepest["parts"] = [child]
+        deepest = child
+
+    # A recursive walk raised RecursionError on a payload like this one.
+    body = gmail._message_body(payload)
+
+    assert body.startswith("level 0")
+    assert len(body) < gmail.MAX_MESSAGE_BODY_CHARACTERS
+
+
+def test_message_body_stops_after_the_part_budget():
+    encoded = urlsafe_b64encode(b"x" * 100).decode().rstrip("=")
+    payload = {
+        "mimeType": "multipart/mixed",
+        "parts": [
+            {
+                "mimeType": "text/plain",
+                "headers": [{"name": "Content-Type", "value": "text/plain"}],
+                "body": {"data": encoded},
+            }
+            for _ in range(gmail.MAX_MESSAGE_PARTS * 2)
+        ],
+    }
+
+    body = gmail._message_body(payload)
+
+    assert len(body) <= gmail.MAX_MESSAGE_PARTS * 101
+
+
+def test_decode_part_text_respects_its_allocation_budget():
+    encoded = urlsafe_b64encode(b"x" * 1_000_000).decode().rstrip("=")
+    part = {
+        "mimeType": "text/plain",
+        "headers": [{"name": "Content-Type", "value": "text/plain"}],
+        "body": {"data": encoded},
+    }
+
+    assert gmail._decode_part_text(part, max_characters=100) == "x" * 100
+
+
+def test_history_pagination_stops_at_the_page_budget_and_records_a_resume_point():
+    pages = [
+        {
+            "historyId": "999",
+            "history": [
+                {
+                    "id": str(1_000 + index),
+                    "messagesAdded": [
+                        {"message": {"id": f"m{index}", "labelIds": ["INBOX"]}}
+                    ],
+                }
+            ],
+            "nextPageToken": f"page-{index + 1}",
+        }
+        for index in range(gmail.MAX_HISTORY_PAGES + 10)
+    ]
+    service = FakeService(profile={}, history=pages)
+
+    ids, history_id = gmail.GmailMailbox(service).new_message_ids("100")
+
+    calls = service.users_resource.history_resource.calls
+    assert len(calls) == gmail.MAX_HISTORY_PAGES
+    assert len(ids) == gmail.MAX_HISTORY_PAGES
+    # The checkpoint is the last record actually read, so the remaining history
+    # is picked up by the next poll instead of being skipped.
+    assert history_id == str(1_000 + gmail.MAX_HISTORY_PAGES - 1)
+
+
+def test_history_message_budget_does_not_skip_the_rest_of_a_final_page():
+    history = [
+        {
+            "id": str(1_000 + index),
+            "messagesAdded": [{"message": {"id": f"m{index}", "labelIds": ["INBOX"]}}],
+        }
+        for index in range(gmail.MAX_HISTORY_MESSAGE_IDS + 1)
+    ]
+    service = FakeService(
+        profile={},
+        history=[{"historyId": "9999", "history": history}],
+    )
+
+    ids, history_id = gmail.GmailMailbox(service).new_message_ids("100")
+
+    assert len(ids) == gmail.MAX_HISTORY_MESSAGE_IDS
+    assert ids[-1] == f"m{gmail.MAX_HISTORY_MESSAGE_IDS - 1}"
+    # The response-level historyId points past every record on the page. The
+    # resume point must instead be the final record represented in this batch.
+    assert history_id == str(1_000 + gmail.MAX_HISTORY_MESSAGE_IDS - 1)
+
+
+def test_one_oversized_history_record_is_kept_whole_to_make_progress():
+    additions = [
+        {"message": {"id": f"m{index}", "labelIds": ["INBOX"]}}
+        for index in range(gmail.MAX_HISTORY_MESSAGE_IDS + 1)
+    ]
+    service = FakeService(
+        profile={},
+        history=[
+            {
+                "historyId": "9999",
+                "history": [{"id": "1000", "messagesAdded": additions}],
+            }
+        ],
+    )
+
+    ids, history_id = gmail.GmailMailbox(service).new_message_ids("100")
+
+    # A history checkpoint cannot resume halfway through one record. Keeping
+    # this exceptional record whole avoids returning the same first slice on
+    # every poll forever.
+    assert len(ids) == gmail.MAX_HISTORY_MESSAGE_IDS + 1
+    assert history_id == "1000"

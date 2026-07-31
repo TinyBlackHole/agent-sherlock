@@ -446,6 +446,9 @@ def test_watch_discord_drops_in_flight_callbacks_after_failure():
                 second = asyncio.create_task(self.on_message("second"))
                 release_callback.set()
                 await asyncio.gather(first, second)
+                # Closing drains the queue, so the consumer's outcome is
+                # observed instead of raced against loop shutdown.
+                await self.close()
 
             asyncio.run(dispatch())
 
@@ -463,6 +466,104 @@ def test_watch_discord_drops_in_flight_callbacks_after_failure():
         )
 
     assert seen == ["first"]
+
+
+def test_watch_discord_stops_loudly_when_the_event_buffer_fills(monkeypatch):
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    seen = []
+
+    def slow_callback(message):
+        seen.append(message)
+        callback_started.set()
+        release_callback.wait(timeout=1)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.user = SimpleNamespace(id=42)
+            self.closed = False
+
+        def run(self, *_args, **_kwargs):
+            async def dispatch():
+                await self.setup_hook()
+                await self.on_ready()
+                await self.on_message("first")
+                await asyncio.to_thread(callback_started.wait, 1)
+                await self.on_message("second")
+                # The one-slot queue is full while "first" is processing.
+                # Waiting here would let discord.py create unbounded callback
+                # tasks, so the third event must fail the watch immediately.
+                await self.on_message("third")
+                release_callback.set()
+                if self._closing_task is not None:
+                    await self._closing_task
+
+            asyncio.run(dispatch())
+
+        async def close(self):
+            self.closed = True
+
+        def is_closed(self):
+            return self.closed
+
+    monkeypatch.setattr(discord, "MAX_QUEUED_GATEWAY_EVENTS", 1)
+
+    with pytest.raises(discord.DiscordWatchError, match="buffer filled"):
+        discord.watch_discord(
+            credentials(),
+            slow_callback,
+            discord_module=_gateway_module(FakeClient),
+        )
+
+    assert seen == ["first"]
+
+
+def test_watch_discord_gracefully_drains_a_full_event_buffer(monkeypatch):
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    seen = []
+
+    def slow_callback(message):
+        seen.append(message)
+        if message == "first":
+            callback_started.set()
+            release_callback.wait(timeout=1)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.user = SimpleNamespace(id=42)
+            self.closed = False
+
+        def run(self, *_args, **_kwargs):
+            async def dispatch():
+                await self.setup_hook()
+                await self.on_ready()
+                await self.on_message("first")
+                await asyncio.to_thread(callback_started.wait, 1)
+                await self.on_message("second")
+                closing = asyncio.create_task(self.close())
+                await asyncio.sleep(0)
+                assert not closing.done()
+                release_callback.set()
+                await closing
+
+            asyncio.run(dispatch())
+
+        async def close(self):
+            self.closed = True
+
+        def is_closed(self):
+            return self.closed
+
+    monkeypatch.setattr(discord, "MAX_QUEUED_GATEWAY_EVENTS", 1)
+
+    discord.watch_discord(
+        credentials(),
+        slow_callback,
+        discord_module=_gateway_module(FakeClient),
+    )
+
+    assert seen == ["first", "second"]
 
 
 def test_watch_discord_keyboard_interrupt_does_not_hide_prior_failure():

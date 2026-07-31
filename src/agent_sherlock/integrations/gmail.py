@@ -20,6 +20,15 @@ GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 STATE_SCHEMA_VERSION = 1
 MAX_CLIENT_SECRETS_BYTES = 1_000_000
 MAX_MESSAGE_BODY_CHARACTERS = 100_000
+# Budgets for hostile or simply enormous payloads. A message is untrusted input:
+# it must never be able to exhaust memory or the interpreter's stack.
+MAX_MESSAGE_PARTS = 1_000
+MAX_MESSAGE_PART_DEPTH = 64
+MAX_DECODED_BODY_CHARACTERS = 4 * MAX_MESSAGE_BODY_CHARACTERS
+MAX_HISTORY_PAGES = 100
+# Fetching happens before a batch is persisted, so keep the normal batch small
+# enough that 100 maximum-sized bodies do not turn one poll into a memory spike.
+MAX_HISTORY_MESSAGE_IDS = 100
 GOOGLE_AUTH_URIS = {
     "https://accounts.google.com/o/oauth2/auth",
     "https://accounts.google.com/o/oauth2/v2/auth",
@@ -217,7 +226,13 @@ def _part_header(part: dict[str, Any], name: str) -> str:
     return ""
 
 
-def _decode_part_text(part: dict[str, Any]) -> str:
+def _decode_part_text(
+    part: dict[str, Any],
+    *,
+    max_characters: int = MAX_DECODED_BODY_CHARACTERS,
+) -> str:
+    if max_characters <= 0:
+        return ""
     body = part.get("body", {})
     if not isinstance(body, dict):
         return ""
@@ -226,8 +241,14 @@ def _decode_part_text(part: dict[str, Any]) -> str:
         return ""
 
     try:
-        padding = "=" * (-len(encoded) % 4)
-        raw = urlsafe_b64decode(f"{encoded}{padding}")
+        # Decode only a bounded prefix. The Gmail response already holds the
+        # base64 string, but this avoids allocating another unbounded byte
+        # buffer for a hostile single MIME part.
+        max_decoded_bytes = max_characters * 4
+        max_encoded_characters = ((max_decoded_bytes + 2) // 3) * 4
+        encoded_prefix = encoded[:max_encoded_characters]
+        padding = "=" * (-len(encoded_prefix) % 4)
+        raw = urlsafe_b64decode(f"{encoded_prefix}{padding}")
     except (ValueError, TypeError):
         return ""
 
@@ -237,36 +258,56 @@ def _decode_part_text(part: dict[str, Any]) -> str:
         message["content-type"] = content_type
     charset = message.get_content_charset() or "utf-8"
     try:
-        return raw.decode(charset, errors="replace")
+        return raw.decode(charset, errors="replace")[:max_characters]
     except LookupError:
-        return raw.decode("utf-8", errors="replace")
+        return raw.decode("utf-8", errors="replace")[:max_characters]
 
 
 def _message_body(payload: dict[str, Any]) -> str:
     plain_text: list[str] = []
     html_text: list[str] = []
+    collected_characters = 0
+    visited_parts = 0
 
-    def collect(part: dict[str, Any]) -> None:
-        mime_type = part.get("mimeType")
+    # Walked iteratively on an explicit stack: a deeply nested MIME tree used to
+    # recurse once per level and could exhaust the interpreter's stack.
+    stack: list[tuple[dict[str, Any], int]] = [(payload, 0)]
+    while stack:
+        part, depth = stack.pop()
+        visited_parts += 1
+        if visited_parts > MAX_MESSAGE_PARTS:
+            break
+
         filename = part.get("filename")
-        if isinstance(filename, str) and filename:
-            return
-        if mime_type == "text/plain":
-            text = _decode_part_text(part)
-            if text:
-                plain_text.append(text)
-        elif mime_type == "text/html":
-            text = _decode_part_text(part)
-            if text:
-                html_text.append(text)
+        if not (isinstance(filename, str) and filename):
+            mime_type = part.get("mimeType")
+            if mime_type in {"text/plain", "text/html"}:
+                remaining_characters = (
+                    MAX_DECODED_BODY_CHARACTERS - collected_characters
+                )
+                text = _decode_part_text(
+                    part,
+                    max_characters=remaining_characters,
+                )
+                if text:
+                    collected_characters += len(text)
+                    target = plain_text if mime_type == "text/plain" else html_text
+                    target.append(text)
+                    if collected_characters >= MAX_DECODED_BODY_CHARACTERS:
+                        break
 
+        if depth >= MAX_MESSAGE_PART_DEPTH:
+            continue
         parts = part.get("parts", [])
         if isinstance(parts, list):
-            for child in parts:
+            available_slots = MAX_MESSAGE_PARTS - visited_parts - len(stack)
+            if available_slots <= 0:
+                continue
+            # Reversed so the stack still yields parts in document order.
+            for child in reversed(parts[:available_slots]):
                 if isinstance(child, dict):
-                    collect(child)
+                    stack.append((child, depth + 1))
 
-    collect(payload)
     text = "\n".join(plain_text).strip()
     if not text and html_text:
         extractor = _HTMLTextExtractor()
@@ -371,7 +412,11 @@ class GmailMailbox:
         seen_ids: set[str] = set()
         next_page_token: str | None = None
         latest_history_id = start_history_id
+        # Resume point for a batch that hits a budget: the newest history record
+        # actually processed, so the next poll continues instead of skipping.
+        resume_history_id = ""
         seen_page_tokens: set[str] = set()
+        pages_read = 0
 
         while True:
             arguments: dict[str, Any] = {
@@ -386,6 +431,7 @@ class GmailMailbox:
 
             request = self._service.users().history().list(**arguments)
             response = _execute(request, "read mailbox history")
+            pages_read += 1
 
             response_history_id = response.get("historyId")
             if isinstance(response_history_id, str) and response_history_id:
@@ -395,12 +441,16 @@ class GmailMailbox:
             if not isinstance(history_records, list):
                 raise GmailAPIError("Gmail returned invalid mailbox history.")
 
+            budget_exhausted = False
             for record in history_records:
                 if not isinstance(record, dict):
                     continue
+                record_id = record.get("id")
                 additions = record.get("messagesAdded", [])
                 if not isinstance(additions, list):
                     continue
+                record_message_ids: list[str] = []
+                record_seen_ids: set[str] = set()
                 for addition in additions:
                     if not isinstance(addition, dict):
                         continue
@@ -415,13 +465,39 @@ class GmailMailbox:
                         isinstance(message_id, str)
                         and message_id
                         and message_id not in seen_ids
+                        and message_id not in record_seen_ids
                     ):
-                        message_ids.append(message_id)
-                        seen_ids.add(message_id)
+                        record_message_ids.append(message_id)
+                        record_seen_ids.add(message_id)
 
+                # Never checkpoint a history record until all of its additions
+                # are represented in this batch. Otherwise a limit reached in
+                # the final API page would skip the unprocessed records.
+                if (
+                    message_ids
+                    and len(message_ids) + len(record_message_ids)
+                    > MAX_HISTORY_MESSAGE_IDS
+                ):
+                    budget_exhausted = True
+                    break
+                message_ids.extend(record_message_ids)
+                seen_ids.update(record_seen_ids)
+                if isinstance(record_id, str) and record_id.isdecimal():
+                    resume_history_id = record_id
+                if len(message_ids) >= MAX_HISTORY_MESSAGE_IDS:
+                    budget_exhausted = True
+                    break
+
+            if budget_exhausted:
+                return message_ids, resume_history_id or start_history_id
             page_token = response.get("nextPageToken")
             if not isinstance(page_token, str) or not page_token:
                 return message_ids, latest_history_id
+            if pages_read >= MAX_HISTORY_PAGES:
+                # Stop before an unbounded backlog turns one poll into an
+                # open-ended run, and check point where this batch stopped so
+                # the remaining history is read on the next poll.
+                return message_ids, resume_history_id or start_history_id
             if page_token in seen_page_tokens:
                 raise GmailAPIError("Gmail returned a repeated mailbox-history page.")
             seen_page_tokens.add(page_token)

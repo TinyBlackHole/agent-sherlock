@@ -5,7 +5,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.client import HTTPException, HTTPSConnection
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,12 @@ TELEGRAM_API_HOST = "api.telegram.org"
 TELEGRAM_TOKEN_PATTERN = re.compile(r"^[0-9]{5,20}:[A-Za-z0-9_-]{20,}$")
 TELEGRAM_MESSAGE_LIMIT = 4_096
 TELEGRAM_SAFE_CHUNK_SIZE = 4_000
+TELEGRAM_CAPTION_LIMIT = 1_024
+TELEGRAM_LONG_MESSAGE_PREVIEW_SIZE = 800
+TELEGRAM_ATTACHMENT_FILENAME = "sherlock-message.txt"
 TELEGRAM_CONNECTION_TIMEOUT_SECONDS = 120.0
+TELEGRAM_EMPTY_MESSAGE_TEXT = "(empty message)"
+MAX_TELEGRAM_API_RESPONSE_BYTES = 1_000_000
 
 
 class TelegramError(RuntimeError):
@@ -87,7 +92,8 @@ class TelegramAuthorization:
 
 @dataclass(frozen=True, slots=True)
 class TelegramCredentials:
-    token: str
+    # The token is a bearer secret: keep it out of reprs, logs, and tracebacks.
+    token: str = field(repr=False)
     chat_id: int
     bot_id: int
     bot_username: str
@@ -155,15 +161,26 @@ class TelegramClient:
         return result
 
     def send_message(self, chat_id: int, text: str) -> None:
-        for chunk in _message_chunks(text):
+        """Deliver one message using exactly one API request.
+
+        Splitting long text across several sendMessage calls made delivery
+        non-atomic: a failure on the second request re-sent the first one on the
+        next retry, so the recipient saw part of the message twice. Anything too
+        long for a single message is uploaded as one attachment instead.
+        """
+        content = text or TELEGRAM_EMPTY_MESSAGE_TEXT
+        if _utf16_length(content) <= TELEGRAM_SAFE_CHUNK_SIZE:
             self._request(
                 "sendMessage",
                 {
                     "chat_id": chat_id,
                     "disable_web_page_preview": True,
-                    "text": chunk,
+                    "text": content,
                 },
             )
+            return
+        body, content_type = _long_message_request(chat_id, content)
+        self._request("sendDocument", body=body, content_type=content_type)
 
     def _request(
         self,
@@ -171,27 +188,38 @@ class TelegramClient:
         payload: dict[str, Any] | None = None,
         *,
         timeout: int = 30,
+        body: bytes | None = None,
+        content_type: str = "application/json",
     ) -> Any:
-        body = json.dumps(payload or {}, separators=(",", ":")).encode()
+        request_body = (
+            body
+            if body is not None
+            else json.dumps(payload or {}, separators=(",", ":")).encode()
+        )
         connection = HTTPSConnection(TELEGRAM_API_HOST, timeout=timeout)
         try:
             connection.request(
                 "POST",
                 f"/bot{self._token}/{method}",
-                body=body,
+                body=request_body,
                 headers={
-                    "Content-Type": "application/json",
+                    "Content-Type": content_type,
                     "User-Agent": "Agent-Sherlock",
                 },
             )
             response = connection.getresponse()
-            raw_response = response.read()
+            raw_response = response.read(MAX_TELEGRAM_API_RESPONSE_BYTES + 1)
             status = response.status
         except (OSError, HTTPException) as exc:
             raise TelegramAPIError("Cannot reach the Telegram API.") from exc
         finally:
             connection.close()
 
+        if len(raw_response) > MAX_TELEGRAM_API_RESPONSE_BYTES:
+            raise TelegramAPIError(
+                "Telegram returned an unexpectedly large API response.",
+                status=status,
+            )
         try:
             response_data = json.loads(raw_response)
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -437,21 +465,49 @@ def _telegram_api_error(raw_response: bytes, *, status: int) -> TelegramAPIError
     )
 
 
-def _message_chunks(text: str) -> tuple[str, ...]:
-    if not text:
-        return ("(empty message)",)
-    chunk_limit = min(TELEGRAM_SAFE_CHUNK_SIZE, TELEGRAM_MESSAGE_LIMIT)
-    chunks: list[str] = []
-    remaining = text
-    while _utf16_length(remaining) > chunk_limit:
-        hard_split = _utf16_prefix_index(remaining, max_units=chunk_limit)
-        newline = remaining.rfind("\n", 0, hard_split)
-        split_at = newline + 1 if newline > 0 else hard_split
-        chunks.append(remaining[:split_at])
-        remaining = remaining[split_at:]
-    if remaining:
-        chunks.append(remaining)
-    return tuple(chunks)
+def _long_message_request(chat_id: int, text: str) -> tuple[bytes, str]:
+    """Build one multipart sendDocument request holding the whole message."""
+    preview_end = _utf16_prefix_index(
+        text,
+        max_units=TELEGRAM_LONG_MESSAGE_PREVIEW_SIZE,
+    )
+    preview = text[:preview_end].rstrip()
+    note = f"…\n\nFull message attached as {TELEGRAM_ATTACHMENT_FILENAME}."
+    caption = f"{preview}\n\n{note}" if preview else note
+    if _utf16_length(caption) > TELEGRAM_CAPTION_LIMIT:
+        # The conservative preview size should keep this unreachable, but a
+        # future wording change must not violate Telegram's caption limit.
+        caption = note
+
+    boundary = f"agent-sherlock-{secrets.token_hex(16)}"
+    fields = {
+        "caption": caption,
+        "chat_id": str(chat_id),
+    }
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        parts.extend(
+            (
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode("utf-8"),
+                b"\r\n",
+            )
+        )
+    parts.extend(
+        (
+            f"--{boundary}\r\n".encode(),
+            (
+                'Content-Disposition: form-data; name="document"; '
+                f'filename="{TELEGRAM_ATTACHMENT_FILENAME}"\r\n'
+            ).encode(),
+            b"Content-Type: text/plain; charset=utf-8\r\n\r\n",
+            text.encode("utf-8"),
+            b"\r\n",
+            f"--{boundary}--\r\n".encode(),
+        )
+    )
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 def _utf16_length(value: str) -> int:

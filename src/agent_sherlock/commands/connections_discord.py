@@ -4,10 +4,13 @@ import argparse
 import getpass
 import sys
 import threading
+import time
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
 from agent_sherlock.application import (
+    MessageIngestError,
     MessagePipeline,
     PendingDeliveryError,
     PipelineError,
@@ -46,6 +49,8 @@ from agent_sherlock.integrations.discord import (
 from agent_sherlock.persistence import MessageRepository, PersistenceError
 
 MAX_TOKEN_FILE_BYTES = 4_096
+DELIVERY_RETRY_INITIAL_SECONDS = 5.0
+DELIVERY_RETRY_MAX_SECONDS = 300.0
 
 
 def configure(providers: argparse._SubParsersAction) -> None:
@@ -267,6 +272,8 @@ def watch_connected_discord(
         f"to {destination_name}. Press Ctrl+C to stop."
     )
 
+    schedule = DeliverySchedule()
+
     def on_ready() -> None:
         write_terminal(message_when_ready)
 
@@ -275,38 +282,50 @@ def watch_connected_discord(
         if normalized is None:
             return
         try:
-            result = pipeline.ingest((normalized,))
-        except PendingDeliveryError as exc:
-            _print_pending_delivery_error(exc)
-            return
-        except (PersistenceError, PipelineError) as exc:
+            pipeline.store((normalized,))
+        except MessageIngestError as exc:
+            # The Gateway does not replay events, so continuing here would drop
+            # this message for good. Stop loudly instead.
             write_terminal(
-                f"Error: {exc} Discord watch remains connected; queued work "
-                "will be retried.",
+                f"Error: {exc} Stopping the Discord watch: the Gateway does not "
+                "replay events, so continuing would drop messages silently. "
+                "Resolve the storage error, then start the watch again.",
                 file=sys.stderr,
             )
-            return
-        _print_delivery_result(
-            delivered=result.delivered,
-            dead_lettered=result.dead_lettered,
-        )
+            raise
+        _deliver_backlog()
 
     def on_maintenance() -> None:
+        _deliver_backlog()
+
+    def _deliver_backlog() -> None:
+        """Drain the queue, at most once per backoff window.
+
+        Every Gateway event used to trigger a full backlog delivery, so an output
+        that was down got hammered once per incoming message. Failures now push
+        the next attempt out exponentially.
+        """
+        if not schedule.ready():
+            return
         try:
             result = pipeline.deliver_pending()
         except PendingDeliveryError as exc:
-            _print_pending_delivery_error(exc)
+            delay = schedule.failed(retry_after=_retry_after_seconds(exc))
+            _print_pending_delivery_error(exc, retry_in_seconds=delay)
             return
         except (PersistenceError, PipelineError) as exc:
+            delay = schedule.failed()
             write_terminal(
                 f"Error: {exc} Discord watch remains connected; queued delivery "
-                "will be retried.",
+                f"will be retried in {delay:.0f}s.",
                 file=sys.stderr,
             )
             return
+        schedule.succeeded()
         _print_delivery_result(
             delivered=result.delivered,
             dead_lettered=result.dead_lettered,
+            truncated=result.truncated,
         )
 
     try:
@@ -325,21 +344,78 @@ def watch_connected_discord(
     return 0
 
 
-def _print_pending_delivery_error(exception: PendingDeliveryError) -> None:
+class DeliverySchedule:
+    """Exponential backoff for backlog delivery attempts."""
+
+    def __init__(
+        self,
+        *,
+        initial_seconds: float = DELIVERY_RETRY_INITIAL_SECONDS,
+        maximum_seconds: float = DELIVERY_RETRY_MAX_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.initial_seconds = initial_seconds
+        self.maximum_seconds = maximum_seconds
+        self._clock = clock
+        self._delay = 0.0
+        self._next_attempt_at = 0.0
+
+    def ready(self) -> bool:
+        return self._clock() >= self._next_attempt_at
+
+    def succeeded(self) -> None:
+        self._delay = 0.0
+        self._next_attempt_at = 0.0
+
+    def failed(self, *, retry_after: float | None = None) -> float:
+        """Push the next attempt out and return how long that will be."""
+        grown = self.initial_seconds if self._delay <= 0 else self._delay * 2
+        delay = min(max(grown, retry_after or 0.0), self.maximum_seconds)
+        self._delay = delay
+        self._next_attempt_at = self._clock() + delay
+        return delay
+
+
+def _retry_after_seconds(exception: PendingDeliveryError) -> float | None:
+    retry_after = exception.retry_after
+    if isinstance(retry_after, bool) or not isinstance(retry_after, int | float):
+        return None
+    return max(0.0, float(retry_after))
+
+
+def _print_pending_delivery_error(
+    exception: PendingDeliveryError,
+    *,
+    retry_in_seconds: float | None = None,
+) -> None:
     if isinstance(exception.cause, DiscordConfigurationError):
         guidance = (
             " Change the output configuration to resolve the conflict; the "
             "message remains queued until then."
         )
-    else:
+    elif retry_in_seconds is None:
         guidance = " Queued delivery will be retried."
+    else:
+        guidance = f" Queued delivery will be retried in {retry_in_seconds:.0f}s."
     write_terminal(f"Error: {exception}{guidance}", file=sys.stderr)
 
 
-def _print_delivery_result(*, delivered: int, dead_lettered: int) -> None:
+def _print_delivery_result(
+    *,
+    delivered: int,
+    dead_lettered: int,
+    truncated: int = 0,
+) -> None:
     if delivered:
         noun = "message" if delivered == 1 else "messages"
         write_terminal(f"Sent {delivered} queued {noun} to the configured output.")
+    if truncated:
+        noun = "message was" if truncated == 1 else "messages were"
+        write_terminal(
+            f"Warning: {truncated} delivered {noun} truncated; the complete "
+            "stored body stays in the local inbox.",
+            file=sys.stderr,
+        )
     if dead_lettered:
         noun = "message" if dead_lettered == 1 else "messages"
         write_terminal(

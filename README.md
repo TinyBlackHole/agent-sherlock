@@ -13,6 +13,11 @@ Install Agent Sherlock with:
 curl -fsSL https://sherlock.tinyblackhole.com/install.sh | sh
 ```
 
+The installer pins a protected, versioned release tag rather than tracking the
+default branch, so two installations of the same version get the same code. Set
+`SHERLOCK_VERSION` to install a different tag. Read the script before piping it
+into a shell, as with any `curl | sh` installer.
+
 For local development, install the CLI in editable mode from this project directory:
 
 ```bash
@@ -60,6 +65,11 @@ For non-interactive setup, place the token in a private temporary file:
 sherlock output telegram connect --token-file /path/to/private-token
 ```
 
+Content that exceeds Telegram's message limit is delivered as a single upload
+with a preview caption and the complete text attached. Sending it as several
+consecutive messages would make a mid-delivery failure re-send the parts that
+already arrived.
+
 The one-time link remains required unless an existing private chat is selected
 with `--chat-id`. Check the connection or send a test:
 
@@ -78,7 +88,8 @@ Before the first connection:
 3. Configure the OAuth consent screen. If the app is in testing mode, add your
    Gmail address as a test user.
 4. Create an OAuth client with the **Desktop app** application type and download
-   its JSON file.
+   its JSON file. Keep it outside the project and, on POSIX systems, restrict it
+   with `chmod 600 /path/to/credentials.json`.
 
 Then run the interactive connection menu:
 
@@ -100,9 +111,12 @@ connection and is not copied into Sherlock's configuration.
 Versions that previously used `gmail.metadata` must reconnect once so Gmail can
 grant the new read-only scope.
 
-The full body of each newly discovered email is stored locally as plaintext in
-SQLite until and after delivery. Sherlock protects that database with private
-filesystem permissions, but does not application-encrypt its contents.
+The normalized body of each newly discovered email (up to 100 000 characters)
+is stored locally as plaintext in SQLite until and after delivery. Sherlock
+protects that database with private filesystem permissions, but does not
+application-encrypt its contents. Delivered messages are deleted once they fall
+outside the retention window — see [Local message
+retention](#local-message-retention).
 
 Check once for mail received since the previous check and deliver it to the
 selected output:
@@ -191,6 +205,17 @@ history is not replayed. Text, attachment links, stickers, and basic embed
 content are normalized into the durable inbox before delivery. Provider message
 IDs make replay after a Gateway reconnect idempotent.
 
+Gateway events arrive on a bounded queue drained by a single consumer, so a slow
+or failing output cannot let callback tasks pile up without limit. If that
+buffer ever fills, Sherlock stops loudly instead of silently dropping events.
+
+Because Discord never replays an event Sherlock already received, a failure to
+*store* one stops the watch with a non-zero exit code: the message is gone, and
+continuing would hide that. Resolve the storage error and start the watch again.
+A failure to *deliver* is different — the message is already durable, so the
+watch stays connected and retries with exponential backoff instead of hammering
+a down output once per incoming message.
+
 The bot token is stored under
 `~/.config/agent-sherlock/connections/discord/` with the same private-file
 protections as the other connections. Never commit the token, and reset it in
@@ -226,8 +251,46 @@ stop all inputs together. If a provider is stuck while shutting down, press
 
 All workers share one durable inbox and one serialized delivery path. This
 allows inputs to receive concurrently without racing to deliver the same queued
-message. The selected output is still resolved for each delivery, so switching
-between Telegram and Discord does not require restarting `sherlock watch`.
+message. Queued messages are also claimed atomically in the database under a
+lease, so two Sherlock processes cannot select the same unexpired work
+concurrently; if one crashes mid-delivery, another picks its work up once the
+lease expires. The selected output is still resolved for each delivery, so
+switching between Telegram and Discord does not require restarting `sherlock
+watch`.
+
+## Delivery guarantees
+
+Delivery is **at least once**, not exactly once. A message is stored before it
+is sent and marked delivered only after the destination accepts it. This keeps
+destination failures from discarding queued work, but a failure in the window
+between the destination accepting a message and Sherlock recording that fact
+results in a repeat on the next attempt. Each delivery is a single API request,
+which keeps a retry from re-sending part of a message that already arrived.
+
+Normalized message bodies are stored up to each connector's documented safety
+limit, then delivered up to a per-message character budget (3 000 by default).
+When a stored body does not fit, the delivered text ends with an explicit note
+stating how many characters were left out, the operational result counts the
+truncation, and the complete stored body stays in the local inbox.
+Raise the budget with `SHERLOCK_MAX_DELIVERY_BODY_CHARACTERS` (200–100 000).
+
+## Local message retention
+
+Stored messages do not accumulate forever. Delivered messages are deleted after
+30 days, dead-letter messages after 90, and the inbox is trimmed to 50 000 rows;
+only already-handled messages are ever removed, so pending work is never dropped
+to make room. Retention runs automatically at most once an hour from the
+delivery path, and on demand:
+
+```bash
+sherlock purge --status          # report the inbox size, delete nothing
+sherlock purge                   # apply the default retention policy
+sherlock purge --days 7          # keep delivered messages for 7 days
+sherlock purge --all             # drop every delivered and dead-letter message
+```
+
+`--max-messages` changes the size cap (`0` disables it), and
+`--dead-letter-days` the dead-letter window.
 
 ## Choose where Sherlock delivers
 

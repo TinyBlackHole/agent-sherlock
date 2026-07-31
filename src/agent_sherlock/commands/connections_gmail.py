@@ -235,6 +235,7 @@ def _print_sync_result(
                         "history_reset": result.history_reset,
                         "initialized": result.initialized,
                         "stored": result.stored,
+                        "truncated": result.truncated,
                     },
                     sort_keys=True,
                 ),
@@ -257,6 +258,13 @@ def _print_sync_result(
     if result.delivered:
         noun = "message" if result.delivered == 1 else "messages"
         write_terminal(f"Sent {result.delivered} {noun} to the configured output.")
+    if result.truncated:
+        noun = "message was" if result.truncated == 1 else "messages were"
+        write_terminal(
+            f"Warning: {result.truncated} delivered {noun} truncated; the complete "
+            "stored body stays in the local inbox.",
+            file=sys.stderr,
+        )
     if result.dead_lettered:
         noun = "message" if result.dead_lettered == 1 else "messages"
         write_terminal(
