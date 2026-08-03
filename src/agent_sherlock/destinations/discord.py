@@ -27,3 +27,6 @@ class DiscordDestination:
 
     def send(self, text: str) -> None:
         self.client.send_message(text)
+
+    def send_important(self, text: str, *, discord_user_id: str) -> None:
+        self.client.send_message(text, mention_user_id=discord_user_id)

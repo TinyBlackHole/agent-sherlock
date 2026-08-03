@@ -268,7 +268,16 @@ Long or multiline instructions can be read from a UTF-8 file with
 `sherlock ai prompt set --file /path/to/instruction.txt`.
 
 The default `augment` mode sends the original message followed by the AI result.
-Its combined output is capped at 1 900 characters so summaries and suggested
+A destination-independent visual header separates them so it remains readable
+in both Discord and Telegram:
+
+```text
+━━━━━━━━━━━━━━━━
+🤖 AGENT SHERLOCK AI
+━━━━━━━━━━━━━━━━
+```
+
+The combined output is capped at 1 900 characters so summaries and suggested
 replies normally remain readable directly in Discord and Telegram instead of
 becoming attachments. A long original or AI result is visibly truncated; use
 `replace` when the transformation itself needs more room:
@@ -277,6 +286,42 @@ becoming attachments. A long original or AI result is visibly truncated; use
 sherlock ai mode augment
 sherlock ai mode replace
 ```
+
+### Mention me in Discord for important messages
+
+Importance notifications are optional and disabled by default. They use the
+same local Ollama request as the normal transformation: the model returns the
+supplement and a separate boolean importance decision. Sherlock, not the model,
+constructs the Discord mention and permits only the configured user ID.
+
+First enable local AI, then set criteria and opt in with your numeric Discord
+user ID:
+
+```bash
+sherlock ai importance criteria set \
+  "Requiere una acción mía, tiene fecha límite o involucra pagos o seguridad."
+sherlock ai importance enable --discord-user-id 123456789012345678
+sherlock ai importance status
+```
+
+The normal `sherlock ai prompt` controls what Sherlock writes; the importance
+criteria independently control when it mentions you. Both have defaults. If
+you customize neither, Sherlock uses its default summary and never mentions
+anyone. Customizing only the normal prompt changes the output without enabling
+mentions. Customizing only the criteria keeps the default summary; mentions
+begin only after the explicit `importance enable` command.
+
+Change or inspect the criteria without enabling notifications:
+
+```bash
+sherlock ai importance criteria show
+sherlock ai importance criteria set --file /path/to/criteria.txt
+sherlock ai importance disable
+```
+
+If Telegram is selected, an important message is delivered normally without a
+Discord mention. Disabling local AI also prevents importance classification;
+the saved importance settings remain available if AI is enabled again.
 
 Verify the connection and instruction without reading Gmail:
 
@@ -303,10 +348,11 @@ time. The watcher does not contact Ollama during startup: if the local service
 is temporarily stopped, inputs stay connected and processing retries from the
 durable queue after Ollama returns.
 
-Each AI result, model name, and configured model digest are saved in SQLite
-before Telegram or Discord is contacted. A destination retry therefore reuses
-exactly the same text instead of invoking the model again. Prompt/model changes
-affect only new messages and queued messages that have not yet been processed.
+Each AI result, importance target, model name, and configured model digest are
+saved in SQLite before Telegram or Discord is contacted. A destination retry
+therefore reuses exactly the same text and importance decision instead of
+invoking the model again. Prompt/model/criteria changes affect only new messages
+and queued messages that have not yet been processed.
 If Ollama is unavailable, Sherlock keeps the original message queued and does
 not silently fall back to forwarding it unprocessed. Transient Ollama failures
 retry indefinitely. A non-retryable processing failure is quarantined in the
@@ -418,9 +464,12 @@ private-file protections as the other connections. Delete the webhook in
 Discord if it is ever exposed.
 
 Forwarded content is posted with mentions and link previews suppressed, so an
-untrusted message body cannot ping a role or `@everyone`. Content that exceeds
-Discord's message limit is delivered in one post with a preview and the complete
-text attached, which prevents partial posts from being duplicated on retry.
+untrusted message body cannot ping a role or `@everyone`. If important-message
+notifications are enabled, only the exact configured Discord user ID can be
+mentioned; roles, `@everyone`, and all other user mentions remain suppressed.
+Content that exceeds Discord's message limit is delivered in one post with a
+preview and the complete text attached, which prevents partial posts from being
+duplicated on retry.
 
 If the Discord input watches the same channel the Discord output posts into,
 both `sherlock watch` and `sherlock connections discord watch` refuse to start

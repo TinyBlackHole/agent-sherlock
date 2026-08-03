@@ -27,3 +27,9 @@ class TelegramDestination:
 
     def send(self, text: str) -> None:
         self.client.send_message(self.credentials.chat_id, text)
+
+    def send_important(self, text: str, *, discord_user_id: str) -> None:
+        # Importance mentions are a Discord-only feature. Telegram still receives
+        # the processed message normally if it is the selected destination.
+        del discord_user_id
+        self.send(text)

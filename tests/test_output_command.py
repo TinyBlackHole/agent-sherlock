@@ -37,8 +37,8 @@ class FakeWebhookClient:
     def __init__(self, _url=WEBHOOK_URL):
         self.sent = []
 
-    def send_message(self, text):
-        self.sent.append(text)
+    def send_message(self, text, *, mention_user_id=None):
+        self.sent.append((text, mention_user_id) if mention_user_id else text)
 
 
 def test_telegram_stays_the_destination_until_it_is_changed(config_dir):
@@ -287,6 +287,18 @@ def test_output_test_sends_through_the_active_destination(
     assert main(["output", "test"]) == 0
     assert client.sent == [output.TEST_MESSAGE]
     assert "Test message sent to discord." in capsys.readouterr().out
+
+
+def test_discord_destination_forwards_the_trusted_importance_target(config_dir):
+    client = FakeWebhookClient()
+    destination = DiscordDestination(_credentials(), client=client)
+
+    destination.send_important(
+        "Needs attention",
+        discord_user_id="123456789012345678",
+    )
+
+    assert client.sent == [("Needs attention", "123456789012345678")]
 
 
 def test_active_destination_observes_switches_while_running(

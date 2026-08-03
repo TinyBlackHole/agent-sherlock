@@ -36,9 +36,10 @@ DISCORD_MESSAGE_LIMIT = 2_000
 DISCORD_SAFE_CONTENT_SIZE = 1_900
 DISCORD_LONG_MESSAGE_PREVIEW_SIZE = 800
 DISCORD_ATTACHMENT_FILENAME = "sherlock-message.txt"
-# Webhook posts must never notify anyone: forwarded bodies are untrusted text
-# that could otherwise contain @everyone or role mentions.
+# Forwarded bodies are untrusted text. Suppress every mention unless the caller
+# provides one validated user ID through the explicit important-message path.
 SUPPRESSED_MENTIONS: dict[str, Any] = {"parse": []}
+DISCORD_USER_ID_PATTERN = re.compile(r"[1-9][0-9]{4,19}")
 SUPPRESS_EMBEDS_FLAG = 1 << 2
 
 
@@ -145,19 +146,40 @@ class DiscordWebhookClient:
             name=raw_name if isinstance(raw_name, str) and raw_name else "webhook",
         )
 
-    def send_message(self, text: str) -> None:
-        safe_text = text or "(empty message)"
-        if len(safe_text) <= DISCORD_SAFE_CONTENT_SIZE:
+    def send_message(self, text: str, *, mention_user_id: str | None = None) -> None:
+        if mention_user_id is not None and (
+            not isinstance(mention_user_id, str)
+            or DISCORD_USER_ID_PATTERN.fullmatch(mention_user_id) is None
+        ):
+            raise DiscordWebhookConfigurationError(
+                "The Discord notification user ID is invalid."
+            )
+        allowed_mentions = (
+            {"users": [mention_user_id]}
+            if mention_user_id is not None
+            else SUPPRESSED_MENTIONS
+        )
+        mention = f"<@{mention_user_id}>\n" if mention_user_id is not None else ""
+        safe_text = f"{mention}{text or '(empty message)'}"
+        inline_limit = (
+            DISCORD_MESSAGE_LIMIT
+            if mention_user_id is not None
+            else DISCORD_SAFE_CONTENT_SIZE
+        )
+        if len(safe_text) <= inline_limit:
             response = self._request(
                 "POST",
                 {
-                    "allowed_mentions": SUPPRESSED_MENTIONS,
+                    "allowed_mentions": allowed_mentions,
                     "content": safe_text,
                     "flags": SUPPRESS_EMBEDS_FLAG,
                 },
             )
         else:
-            body, content_type = _long_message_request(safe_text)
+            body, content_type = _long_message_request(
+                safe_text,
+                allowed_mentions=allowed_mentions,
+            )
             response = self._request(
                 "POST",
                 raw_body=body,
@@ -402,7 +424,11 @@ def _discord_webhook_api_error(
     )
 
 
-def _long_message_request(text: str) -> tuple[bytes, str]:
+def _long_message_request(
+    text: str,
+    *,
+    allowed_mentions: dict[str, Any] | None = None,
+) -> tuple[bytes, str]:
     """Build one multipart request containing a preview and the full message."""
     preview = text[:DISCORD_LONG_MESSAGE_PREVIEW_SIZE].rstrip()
     note = f"…\n\nFull message attached as {DISCORD_ATTACHMENT_FILENAME}."
@@ -413,7 +439,7 @@ def _long_message_request(text: str) -> tuple[bytes, str]:
         content = note
 
     payload = {
-        "allowed_mentions": SUPPRESSED_MENTIONS,
+        "allowed_mentions": allowed_mentions or SUPPRESSED_MENTIONS,
         "attachments": [
             {
                 "description": "Full forwarded Agent Sherlock message",

@@ -18,7 +18,7 @@ from agent_sherlock.storage import (
     harden_private_file,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DATABASE_BUSY_TIMEOUT_MS = 5_000
 MAX_STORED_ERROR_CHARACTERS = 1_000
 MAX_PROCESSED_TEXT_CHARACTERS = 250_000
@@ -47,7 +47,8 @@ _MESSAGE_COLUMNS = """
     processor_name,
     processor_model,
     processor_model_digest,
-    processing_attempts
+    processing_attempts,
+    discord_notification_user_id
 """
 
 _CREATE_MESSAGES_TABLE = """
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     processor_name TEXT NOT NULL DEFAULT '',
     processor_model TEXT NOT NULL DEFAULT '',
     processor_model_digest TEXT NOT NULL DEFAULT '',
+    discord_notification_user_id TEXT NOT NULL DEFAULT '',
     processing_attempts INTEGER NOT NULL DEFAULT 0
         CHECK (processing_attempts >= 0),
     last_processing_error TEXT NOT NULL DEFAULT '',
@@ -125,6 +127,34 @@ _V4_MIGRATION_COLUMNS = (
     "processed_at",
 )
 
+_V5_MIGRATION_COLUMNS = (
+    "id",
+    "source",
+    "account_id",
+    "external_id",
+    "conversation_id",
+    "sender",
+    "subject",
+    "body",
+    "received_at",
+    "metadata_json",
+    "delivery_status",
+    "delivery_attempts",
+    "last_delivery_error",
+    "claimed_by",
+    "claim_expires_at",
+    "processed_text",
+    "processed_omitted_characters",
+    "processor_name",
+    "processor_model",
+    "processor_model_digest",
+    "processing_attempts",
+    "last_processing_error",
+    "processed_at",
+    "delivered_at",
+    "created_at",
+)
+
 
 def _with_message_columns(statement: str) -> str:
     """Insert the fixed projection used to deserialize stored messages."""
@@ -161,6 +191,7 @@ class StoredMessage:
     processor_model: str = ""
     processor_model_digest: str = ""
     processing_attempts: int = 0
+    discord_notification_user_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +261,7 @@ class MessageRepository:
                     WHERE type = 'table' AND name = 'inbound_messages'
                     """
                 ).fetchone()
-                if current_version in {1, 2, 3, 4} or (
+                if current_version in {1, 2, 3, 4, 5} or (
                     current_version == 0 and has_messages_table is not None
                 ):
                     self._migrate_legacy(connection, current_version=current_version)
@@ -278,9 +309,12 @@ class MessageRepository:
         current_version: int,
     ) -> None:
         """Rebuild any older schema into the current one, preserving every row."""
-        migration_columns = (
-            _V4_MIGRATION_COLUMNS if current_version == 4 else _LEGACY_COLUMNS
-        )
+        if current_version == 5:
+            migration_columns = _V5_MIGRATION_COLUMNS
+        elif current_version == 4:
+            migration_columns = _V4_MIGRATION_COLUMNS
+        else:
+            migration_columns = _LEGACY_COLUMNS
         connection.execute("BEGIN IMMEDIATE")
         try:
             connection.execute("DROP INDEX IF EXISTS idx_inbound_pending")
@@ -569,6 +603,7 @@ class MessageRepository:
         processor_name: str,
         processor_model: str,
         processor_model_digest: str,
+        discord_notification_user_id: str,
         processed_at: datetime,
         worker_id: str,
     ) -> None:
@@ -589,6 +624,15 @@ class MessageRepository:
             for value in metadata
         ):
             raise PersistenceError("Processed message metadata is invalid.")
+        if not isinstance(discord_notification_user_id, str) or (
+            discord_notification_user_id
+            and (
+                not discord_notification_user_id.isdigit()
+                or discord_notification_user_id.startswith("0")
+                or not 5 <= len(discord_notification_user_id) <= 20
+            )
+        ):
+            raise PersistenceError("Discord notification user ID is invalid.")
         if processed_at.tzinfo is None:
             raise PersistenceError("Processed timestamp must include a timezone.")
         self._update_delivery(
@@ -600,6 +644,7 @@ class MessageRepository:
                 processor_name = ?,
                 processor_model = ?,
                 processor_model_digest = ?,
+                discord_notification_user_id = ?,
                 last_processing_error = '',
                 processed_at = ?
             WHERE id = ?
@@ -611,6 +656,7 @@ class MessageRepository:
                 processor_name,
                 processor_model,
                 processor_model_digest,
+                discord_notification_user_id,
                 processed_at.isoformat(),
                 record_id,
             ),
@@ -848,6 +894,7 @@ class MessageRepository:
         processed_omitted = row[12]
         processor_metadata = row[13:16]
         processing_attempts = row[16]
+        discord_notification_user_id = row[17]
         if processed_text is not None and (
             not isinstance(processed_text, str)
             or not processed_text
@@ -873,6 +920,15 @@ class MessageRepository:
             or processing_attempts < 0
         ):
             raise ValueError("processing attempts must be a non-negative integer")
+        if not isinstance(discord_notification_user_id, str) or (
+            discord_notification_user_id
+            and (
+                not discord_notification_user_id.isdigit()
+                or discord_notification_user_id.startswith("0")
+                or not 5 <= len(discord_notification_user_id) <= 20
+            )
+        ):
+            raise ValueError("Discord notification user ID must be a snowflake")
         return StoredMessage(
             record_id=row[0],
             message=InboundMessage(
@@ -893,4 +949,5 @@ class MessageRepository:
             processor_model=processor_metadata[1],
             processor_model_digest=processor_metadata[2],
             processing_attempts=processing_attempts,
+            discord_notification_user_id=discord_notification_user_id,
         )

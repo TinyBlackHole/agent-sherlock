@@ -18,12 +18,16 @@ MAX_SUPPLEMENT_CHARACTERS = 12_000
 _OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
+        "important": {
+            "type": "boolean",
+            "description": "Whether the configured importance criteria match.",
+        },
         "supplement": {
             "type": "string",
             "description": "The result of applying the user's instruction.",
-        }
+        },
     },
-    "required": ["supplement"],
+    "required": ["important", "supplement"],
     "additionalProperties": False,
 }
 
@@ -59,6 +63,7 @@ class OllamaModel:
 class OllamaChatResult:
     supplement: str
     model: str
+    important: bool = False
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
@@ -204,7 +209,8 @@ class OllamaClient:
             ) from exc
         if (
             not isinstance(structured, dict)
-            or set(structured) != {"supplement"}
+            or set(structured) != {"important", "supplement"}
+            or type(structured.get("important")) is not bool
             or not isinstance(structured.get("supplement"), str)
         ):
             raise OllamaResponseError(
@@ -219,6 +225,7 @@ class OllamaClient:
         return OllamaChatResult(
             supplement=supplement,
             model=_safe_text(response_model, limit=200),
+            important=structured["important"],
         )
 
     def _request(

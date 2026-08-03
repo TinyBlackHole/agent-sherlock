@@ -88,6 +88,7 @@ class ProcessedMessage:
     processor_name: str = "plain"
     processor_model: str = ""
     processor_model_digest: str = ""
+    discord_notification_user_id: str = ""
 
 
 class MessageProcessor(Protocol):
@@ -303,6 +304,7 @@ class MessagePipeline:
                 processor_name=processed.processor_name,
                 processor_model=processed.processor_model,
                 processor_model_digest=processed.processor_model_digest,
+                discord_notification_user_id=(processed.discord_notification_user_id),
                 processed_at=datetime.now(UTC),
                 worker_id=self.worker_id,
             )
@@ -313,10 +315,19 @@ class MessagePipeline:
                 processor_name=stored_message.processor_name,
                 processor_model=stored_message.processor_model,
                 processor_model_digest=stored_message.processor_model_digest,
+                discord_notification_user_id=(
+                    stored_message.discord_notification_user_id
+                ),
             )
 
         try:
-            self.destination.send(processed.text)
+            if processed.discord_notification_user_id:
+                self.destination.send_important(
+                    processed.text,
+                    discord_user_id=processed.discord_notification_user_id,
+                )
+            else:
+                self.destination.send(processed.text)
         except Exception as exc:
             attempt = stored_message.delivery_attempts + 1
             if _should_dead_letter(

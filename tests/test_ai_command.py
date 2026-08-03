@@ -20,6 +20,7 @@ class FakeOllamaClient:
         return SimpleNamespace(
             supplement="Synthetic summary.",
             model="qwen2.5:7b",
+            important=False,
         )
 
 
@@ -149,6 +150,45 @@ def test_ai_prompt_file_normalizes_windows_line_endings(tmp_path):
     assert main(["ai", "prompt", "set", "--file", str(prompt_file)]) == 0
 
     assert ai_settings.load_ai_config().prompt == "Summarize this.\nDraft a reply."
+
+
+def test_ai_importance_notifications_are_opt_in_and_configurable(capsys):
+    ai_settings.save_ai_config(ai_settings.AIConfig(enabled=True, model="qwen2.5:7b"))
+
+    assert (
+        main(
+            [
+                "ai",
+                "importance",
+                "criteria",
+                "set",
+                "Requiere una respuesta hoy.",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "ai",
+                "importance",
+                "enable",
+                "--discord-user-id",
+                "123456789012345678",
+            ]
+        )
+        == 0
+    )
+
+    config = ai_settings.load_ai_config()
+    assert config.importance_enabled
+    assert config.importance_criteria == "Requiere una respuesta hoy."
+    assert config.discord_user_id == "123456789012345678"
+    assert main(["ai", "importance", "status"]) == 0
+    assert "enabled" in capsys.readouterr().out
+
+    assert main(["ai", "importance", "disable"]) == 0
+    assert not ai_settings.load_ai_config().importance_enabled
 
 
 def test_ai_prompt_configuration_failure_returns_operational_error(

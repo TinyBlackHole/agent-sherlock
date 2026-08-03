@@ -200,6 +200,34 @@ def test_send_message_suppresses_mentions_and_embeds(monkeypatch):
     assert connection.closed
 
 
+def test_send_message_mentions_only_the_explicitly_allowed_user(monkeypatch):
+    connection = FakeConnection([FakeResponse(200, b'{"id": "999"}')])
+    monkeypatch.setattr(discord_webhook, "HTTPSConnection", connection)
+
+    discord_webhook.DiscordWebhookClient(WEBHOOK_URL).send_message(
+        "Important @everyone <@&987654321>",
+        mention_user_id="123456789012345678",
+    )
+
+    payload = connection.requests[0]["body"]
+    assert payload == {
+        "allowed_mentions": {"users": ["123456789012345678"]},
+        "content": ("<@123456789012345678>\nImportant @everyone <@&987654321>"),
+        "flags": 4,
+    }
+
+
+def test_send_message_rejects_an_invalid_notification_user_id():
+    with pytest.raises(
+        discord_webhook.DiscordWebhookConfigurationError,
+        match="user ID",
+    ):
+        discord_webhook.DiscordWebhookClient(WEBHOOK_URL).send_message(
+            "Important",
+            mention_user_id="@everyone",
+        )
+
+
 def test_send_message_posts_long_text_once_with_the_full_message_attached(monkeypatch):
     connection = FakeConnection([FakeResponse(200, b'{"id": "999"}')])
     monkeypatch.setattr(discord_webhook, "HTTPSConnection", connection)

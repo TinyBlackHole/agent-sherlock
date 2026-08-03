@@ -88,6 +88,9 @@ class ActiveDestination:
     def send(self, text: str) -> None:
         self._resolve().send(text)
 
+    def send_important(self, text: str, *, discord_user_id: str) -> None:
+        self._resolve().send_important(text, discord_user_id=discord_user_id)
+
     def _resolve(self) -> MessageDestination:
         destination = open_active_destination(paths=self.paths)
         if self.validator is not None:

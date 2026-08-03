@@ -7,8 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_sherlock.ai import (
+    MAX_IMPORTANCE_CRITERIA_CHARACTERS,
     MAX_PROMPT_CHARACTERS,
     SYSTEM_PROMPT_VERSION,
+    AIConfig,
     AIConfigurationError,
     OllamaMessageProcessor,
     configured_model,
@@ -88,6 +90,63 @@ def configure(parser: argparse.ArgumentParser) -> None:
     )
     prompt_set.set_defaults(ai_handler=run_prompt_set)
     prompt.set_defaults(ai_parser=prompt)
+
+    importance = actions.add_parser(
+        "importance",
+        help="Configure Discord mentions for important messages.",
+    )
+    importance_actions = importance.add_subparsers(
+        dest="importance_action",
+        metavar="<action>",
+    )
+    importance_status = importance_actions.add_parser(
+        "status",
+        help="Show importance-notification settings.",
+    )
+    importance_status.set_defaults(ai_handler=run_importance_status)
+    importance_enable = importance_actions.add_parser(
+        "enable",
+        help="Mention one Discord user when AI marks a message important.",
+    )
+    importance_enable.add_argument(
+        "--discord-user-id",
+        help="Discord user ID to mention; required the first time.",
+    )
+    importance_enable.set_defaults(ai_handler=run_importance_enable)
+    importance_disable = importance_actions.add_parser(
+        "disable",
+        help="Stop mentioning the configured Discord user.",
+    )
+    importance_disable.set_defaults(ai_handler=run_importance_disable)
+    criteria = importance_actions.add_parser(
+        "criteria",
+        help="Show or change what AI considers important.",
+    )
+    criteria_actions = criteria.add_subparsers(
+        dest="criteria_action",
+        metavar="<action>",
+    )
+    criteria_show = criteria_actions.add_parser(
+        "show",
+        help="Show the current importance criteria.",
+    )
+    criteria_show.set_defaults(ai_handler=run_importance_criteria_show)
+    criteria_set = criteria_actions.add_parser(
+        "set",
+        help="Change the importance criteria.",
+    )
+    criteria_set.add_argument(
+        "text",
+        nargs="*",
+        help="Criteria text. Quote it when it contains spaces.",
+    )
+    criteria_set.add_argument(
+        "--file",
+        help="Read the criteria from a UTF-8 text file.",
+    )
+    criteria_set.set_defaults(ai_handler=run_importance_criteria_set)
+    criteria.set_defaults(ai_parser=criteria)
+    importance.set_defaults(ai_parser=importance)
 
     mode = actions.add_parser(
         "mode",
@@ -242,6 +301,101 @@ def run_prompt_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_importance_status(_args: argparse.Namespace) -> int:
+    try:
+        config = load_ai_config()
+    except AIConfigurationError as exc:
+        print_error(exc)
+        return 1
+    state = _importance_state(config)
+    print(f"Important-message Discord mentions: {state}")
+    print(f"Discord user ID: {config.discord_user_id or '(not configured)'}")
+    print("Importance criteria:")
+    for line in config.importance_criteria.splitlines() or [""]:
+        print(f"  {terminal_safe(line, fallback='')}")
+    return 0
+
+
+def run_importance_enable(args: argparse.Namespace) -> int:
+    provided_user_id = (getattr(args, "discord_user_id", None) or "").strip()
+    try:
+        config = load_ai_config()
+        if not config.enabled:
+            raise AIConfigurationError(
+                "Enable local AI before enabling importance notifications."
+            )
+        user_id = provided_user_id or config.discord_user_id
+        if not user_id:
+            print(
+                "Error: provide --discord-user-id the first time importance "
+                "notifications are enabled.",
+                file=sys.stderr,
+            )
+            return 2
+        save_ai_config(
+            replace(
+                config,
+                importance_enabled=True,
+                discord_user_id=user_id,
+            )
+        )
+    except AIConfigurationError as exc:
+        print_error(exc)
+        return 1
+    print(f"Important messages will mention Discord user {user_id}.")
+    return 0
+
+
+def run_importance_disable(_args: argparse.Namespace) -> int:
+    try:
+        config = load_ai_config()
+        save_ai_config(replace(config, importance_enabled=False))
+    except AIConfigurationError as exc:
+        print_error(exc)
+        return 1
+    print("Important-message Discord mentions disabled.")
+    return 0
+
+
+def run_importance_criteria_show(_args: argparse.Namespace) -> int:
+    try:
+        config = load_ai_config()
+    except AIConfigurationError as exc:
+        print_error(exc)
+        return 1
+    print(config.importance_criteria)
+    return 0
+
+
+def run_importance_criteria_set(args: argparse.Namespace) -> int:
+    words = getattr(args, "text", [])
+    criteria_file = getattr(args, "file", None)
+    if words and criteria_file:
+        print("Error: provide criteria text or --file, not both.", file=sys.stderr)
+        return 2
+    if criteria_file:
+        text = _read_instruction_file(
+            Path(criteria_file).expanduser(),
+            description="importance-criteria",
+            max_characters=MAX_IMPORTANCE_CRITERIA_CHARACTERS,
+        )
+        if text is None:
+            return 2
+    else:
+        text = " ".join(words).strip()
+    if not text:
+        print("Error: the importance criteria must not be empty.", file=sys.stderr)
+        return 2
+    try:
+        config = load_ai_config()
+        save_ai_config(replace(config, importance_criteria=text))
+    except AIConfigurationError as exc:
+        print_error(exc)
+        return 1
+    print("Importance criteria updated for new, unprocessed messages.")
+    return 0
+
+
 def run_mode(args: argparse.Namespace) -> int:
     value = (getattr(args, "value", None) or "").strip()
     if not value:
@@ -303,6 +457,8 @@ def run_status(_args: argparse.Namespace) -> int:
     print(f"Endpoint: {config.base_url}")
     print(f"Model: {terminal_safe(config.model) if config.model else '(not selected)'}")
     print(f"Delivery mode: {config.mode}")
+    print(f"Important-message Discord mentions: {_importance_state(config)}")
+    print(f"Discord notification user: {config.discord_user_id or '(not configured)'}")
     print(f"Permanent Agent Sherlock context: built in (v{SYSTEM_PROMPT_VERSION})")
     print("User instruction:")
     for line in config.prompt.splitlines() or [""]:
@@ -358,6 +514,10 @@ def run_test(_args: argparse.Namespace) -> int:
         return 1
     print("Local AI test result:")
     print(result.text)
+    print(
+        "Would mention configured Discord user: "
+        f"{'yes' if result.discord_notification_user_id else 'no'}"
+    )
     return 0
 
 
@@ -370,22 +530,43 @@ def _find_model(models: tuple[OllamaModel, ...], name: str) -> OllamaModel:
     )
 
 
-def _read_prompt_file(path: Path) -> str | None:
+def _importance_state(config: AIConfig) -> str:
+    if not config.importance_enabled:
+        return "disabled"
+    if not config.enabled:
+        return "configured but inactive while local AI is disabled"
+    return "enabled"
+
+
+def _read_instruction_file(
+    path: Path,
+    *,
+    description: str,
+    max_characters: int,
+) -> str | None:
     try:
         is_file = path.is_file()
         size = path.stat().st_size if is_file else 0
     except (OSError, UnicodeError):
-        print(f"Error: cannot read AI instruction file: {path}", file=sys.stderr)
+        print(f"Error: cannot read {description} file: {path}", file=sys.stderr)
         return None
-    if not is_file or size > MAX_PROMPT_CHARACTERS * 4:
-        print(f"Error: cannot read AI instruction file: {path}", file=sys.stderr)
+    if not is_file or size > max_characters * 4:
+        print(f"Error: cannot read {description} file: {path}", file=sys.stderr)
         return None
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
-        print(f"Error: cannot read AI instruction file: {path}", file=sys.stderr)
+        print(f"Error: cannot read {description} file: {path}", file=sys.stderr)
         return None
     return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _read_prompt_file(path: Path) -> str | None:
+    return _read_instruction_file(
+        path,
+        description="AI instruction",
+        max_characters=MAX_PROMPT_CHARACTERS,
+    )
 
 
 COMMAND = Command(
