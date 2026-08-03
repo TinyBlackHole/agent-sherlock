@@ -5,7 +5,7 @@ set -eu
 # means two installs an hour apart can ship different code, so overriding this
 # is a deliberate developer action rather than the norm. Release tags must be
 # protected against updates in the repository settings.
-SHERLOCK_VERSION="${SHERLOCK_VERSION:-v0.1.0}"
+SHERLOCK_VERSION="${SHERLOCK_VERSION:-v0.2.0}"
 REPOSITORY="${SHERLOCK_REPOSITORY:-https://github.com/TinyBlackHole/agent-sherlock.git}"
 PACKAGE_SPEC="${SHERLOCK_PACKAGE_SPEC:-git+${REPOSITORY}@${SHERLOCK_VERSION}}"
 
